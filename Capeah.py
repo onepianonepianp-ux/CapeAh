@@ -7,8 +7,8 @@ Fitur:
   1. CEK VALID  - Single & Bulk (sampai game server + role info)
   2. CEK BAN    - Single & Bulk
   3. SPLIT / DEVICE MANAGER
-  4. 4 VERIFIKASI LANGKAH - 3X SCAN  ← NEW
-  5. TELEGRAM BOT  ← NEW
+  4. 4 VERIFIKASI LANGKAH - 3X SCAN  ← PATCHED (Retry + Voting Mayoritas)
+  5. TELEGRAM BOT
   6. EXIT
 
 Logic valid: login server -> game server -> request role info
@@ -44,13 +44,25 @@ init(autoreset=True)
 
 console = Console()
 
+# ── VERIF DEBUG LOGGER ──────────────────────────────────────────────
+verif_logger = logging.getLogger("verif")
+if not verif_logger.handlers:
+    _vh = logging.FileHandler("verif_debug.log", mode="a", encoding="utf-8")
+    _vh.setFormatter(logging.Formatter("%(asctime)s | %(message)s"))
+    _vh.setLevel(logging.WARNING)
+    verif_logger.addHandler(_vh)
+    verif_logger.setLevel(logging.WARNING)
+    verif_logger.propagate = False
+
 # ── DEVICE/SPLIT CONFIG ─────────────────────────────────────────────
 DEVICE_RE = re.compile(r"(?i)(?:and_|ios_)[A-Za-z0-9_-]+")
 RESULTS = Path(__file__).resolve().parent / "results"
 
 # ── FITUR 4 CONFIG ──────────────────────────────────────────────────
-MAX_FILE_SIZE = 20 * 1024 * 1024  # 20 MB
-VERIF_THREADS = 20
+MAX_FILE_SIZE = 20 * 1024 * 1024   # 20 MB
+VERIF_THREADS = 10                 # diturunkan biar server ga rate-limit
+VERIF_RETRY   = 3                  # retry kalau UNKNOWN
+SOCKET_TIMEOUT = 15                # naik dari 5 detik
 
 # ── GLOBAL MODE FLAGS ────────────────────────────────────────────────
 DEBUG_MODE = False
@@ -268,7 +280,7 @@ class BaseConnection:
 
     def connect(self):
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.socket.settimeout(5)
+        self.socket.settimeout(SOCKET_TIMEOUT)
         self.socket.connect((self.host, self.port))
 
     def cleanup(self):
@@ -396,7 +408,7 @@ class GameLogin(BaseConnection):
             self.advertising_id = ""
 
         self.channel = 'and_usa'
-        self.client_version = '2.2.16.1232.1'  # ← SAMA dengan bot BF
+        self.client_version = '2.2.16.1232.1'
         self.account_id = 0
         self.session_key = ''
         self.zone_id = 0
@@ -586,14 +598,12 @@ class GameLogin(BaseConnection):
 
             dbg(f"CONNECTED TO GAME SERVER", color=Fore.GREEN)
 
-            # Request role info
             role_info = None
             try:
                 role_info = self.get_skin_role_info(self.account_id, self.zone_id)
             except Exception as e:
                 dbg(f"ROLE INFO FAILED: {e}", color=Fore.YELLOW)
 
-            # Coba lookup player untuk dapat nickname, level, dll.
             pdata = None
             try:
                 result = self.lookup_player(self.account_id, "id")
@@ -658,7 +668,7 @@ class BanCheckerConnection:
             self.advertising_id = ""
 
         self.channel = 'and_usa'
-        self.client_version = '2.2.16.1232.1'  # ← SAMA dengan bot BF
+        self.client_version = '2.2.16.1232.1'
         self.account_id = 0
         self.session_key = ''
         self.zone_id = 0
@@ -671,7 +681,7 @@ class BanCheckerConnection:
         if port:
             self.port = port
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.socket.settimeout(5)
+        self.socket.settimeout(SOCKET_TIMEOUT)
         self.socket.connect((self.host, self.port))
 
     def cleanup(self):
@@ -1523,7 +1533,7 @@ def split_manager_menu():
 
 
 # ══════════════════════════════════════════════════════════════════════
-# FITUR NOMOR 4 — 4 VERIFIKASI LANGKAH (3X SCAN)
+# FITUR NOMOR 4 — 4 VERIFIKASI LANGKAH (3X SCAN) [PATCHED]
 # ══════════════════════════════════════════════════════════════════════
 def read_device_ids_from_text_verif(text: str) -> List[str]:
     """
@@ -1531,7 +1541,6 @@ def read_device_ids_from_text_verif(text: str) -> List[str]:
     """
     text = text or ""
     stripped = text.strip()
-    # Coba parse JSON lebih dulu
     if stripped.startswith("[") or stripped.startswith("{"):
         try:
             data = json.loads(stripped)
@@ -1561,7 +1570,6 @@ def read_device_ids_from_text_verif(text: str) -> List[str]:
         except Exception:
             pass
 
-    # Fallback TXT
     records = extract_records(text)
     clean, _ = unique_records_keep_order(records)
     return [r["id"] for r in clean]
@@ -1584,23 +1592,48 @@ def load_devices_from_file_verif(filepath: str) -> List[str]:
     return read_device_ids_from_text_verif(text)
 
 
+# ─── PATCHED: Retry helpers ──────────────────────────────────────────
+def _verif_check_with_retry_valid(device_id: str, max_retry: int = VERIF_RETRY):
+    """Retry valid check sampai sukses atau habis retry."""
+    for attempt in range(max_retry):
+        try:
+            data = GameLogin(device_id).run()
+            if data and data.get("account_id") and data.get("zone_id"):
+                return data
+        except Exception:
+            pass
+        time.sleep(0.4 * (attempt + 1))
+    return None
+
+
+def _verif_check_with_retry_ban(device_id: str, max_retry: int = VERIF_RETRY):
+    """Retry ban check sampai dapat CLEAN/BANNED (bukan UNKNOWN)."""
+    last_status, last_result = "UNKNOWN", device_id
+    for attempt in range(max_retry):
+        try:
+            status, result = check_device_ban_silent(device_id)
+            if status in ("CLEAN", "BANNED"):
+                return status, result
+            last_status, last_result = status, result
+        except Exception:
+            pass
+        time.sleep(0.4 * (attempt + 1))
+    if last_status == "UNKNOWN":
+        try:
+            verif_logger.warning(f"UNKNOWN after {max_retry}x retry: {device_id}")
+        except Exception:
+            pass
+    return last_status, last_result
+
+
 def _verif_single_scan(
     devices: List[str],
     scan_no: int,
     threads: int,
 ) -> Dict[str, dict]:
     """
-    Menjalankan SATU siklus scan lengkap: Valid -> Banned.
-    Menggunakan mekanisme ASLI:
-      - Cek Valid  : GameLogin(device_id).run()
-      - Cek Banned : check_device_ban_silent(device_id)
-    Return:
-        { device_id: {
-              "valid": bool,
-              "ban_status": "BANNED" | "CLEAN" | "UNKNOWN" | None,
-              "ban_string": str | None,
-              "data": dict | None
-          } }
+    SATU siklus scan lengkap: Valid -> Banned.
+    Dengan retry otomatis untuk device yang UNKNOWN.
     """
     total = len(devices)
     valid_devs: List[Tuple[str, dict]] = []
@@ -1613,7 +1646,7 @@ def _verif_single_scan(
     # ── LANGKAH 1: CEK VALID ──────────────────────────────────────
     def worker_v(d):
         try:
-            return d, GameLogin(d).run()
+            return d, _verif_check_with_retry_valid(d)
         except Exception:
             return d, None
 
@@ -1662,7 +1695,7 @@ def _verif_single_scan(
     vf.shutdown(wait=False)
     print()
 
-    # ── LANGKAH 2: CEK BANNED ─────────────────────────────────────
+    # ── LANGKAH 2: CEK BANNED (dengan retry) ──────────────────────
     ban_map: Dict[str, Tuple[str, str]] = {}
     if valid_devs:
         tb = len(valid_devs)
@@ -1672,7 +1705,7 @@ def _verif_single_scan(
 
         def worker_b(dev):
             try:
-                return check_device_ban_silent(dev)
+                return _verif_check_with_retry_ban(dev)
             except Exception:
                 return "UNKNOWN", dev
 
@@ -1719,7 +1752,6 @@ def _verif_single_scan(
         bf.shutdown(wait=False)
         print()
 
-    # ── Build result map ─────────────────────────────────────────
     result: Dict[str, dict] = {}
     for d in devices:
         result[d] = {
@@ -1738,8 +1770,37 @@ def _verif_single_scan(
     return result
 
 
+# ─── PATCHED: Voting helper ──────────────────────────────────────────
+def _verif_decide_single(s1: dict, s2: dict, s3: dict) -> Tuple[str, Any]:
+    """
+    Logika voting final.
+    Return: (verdict, payload)
+      verdict = "CLEAN" | "BANNED" | "INCONSISTENT" | "INVALID"
+      payload = data dict (CLEAN), ban_str (BANNED), atau reason (INCONSISTENT)
+    """
+    v1 = bool(s1.get("valid"))
+    v2 = bool(s2.get("valid"))
+    v3 = bool(s3.get("valid"))
+    b1 = s1.get("ban_status") or "UNKNOWN"
+    b2 = s2.get("ban_status") or "UNKNOWN"
+    b3 = s3.get("ban_status") or "UNKNOWN"
+
+    if sum([v1, v2, v3]) < 2:
+        return "INVALID", None
+
+    clean_votes = [b1, b2, b3].count("CLEAN")
+    banned_votes = [b1, b2, b3].count("BANNED")
+
+    if clean_votes >= 2:
+        data = s3.get("data") or s2.get("data") or s1.get("data") or {}
+        return "CLEAN", data
+    if banned_votes >= 2:
+        ban_str = s3.get("ban_string") or s2.get("ban_string") or s1.get("ban_string")
+        return "BANNED", ban_str
+    return "INCONSISTENT", f"scan1={b1}, scan2={b2}, scan3={b3}"
+
+
 def _verif_format_clean_record(device_id: str, data: dict) -> str:
-    """Format record untuk device valid + clean (mengikuti format save_valid_result)."""
     pd = (data or {}).get("player_data") or {}
     return (
         f"DEVICE ID  : {device_id}\n"
@@ -1756,7 +1817,6 @@ def _verif_format_clean_record(device_id: str, data: dict) -> str:
 
 
 def _verif_ban_line(device_id: str, ban_string: Optional[str]) -> str:
-    """Format baris untuk device banned (mengikuti format_ban_string)."""
     if ban_string:
         return ban_string
     return (
@@ -1773,7 +1833,7 @@ def verif_3x_bulk():
     print(f"    {Fore.CYAN}•{Style.RESET_ALL} Scan 1 → 🔍 Cek Valid + 🚫 Cek Banned")
     print(f"    {Fore.CYAN}•{Style.RESET_ALL} Scan 2 → 🔄 Ulangi Cek Valid + Cek Banned")
     print(f"    {Fore.CYAN}•{Style.RESET_ALL} Scan 3 → ✅ Verifikasi akhir (Valid + Banned)")
-    print(f"    {Fore.CYAN}•{Style.RESET_ALL} Bandingkan hasil 3 scan → hanya status konsisten yang di-verifikasi")
+    print(f"    {Fore.CYAN}•{Style.RESET_ALL} Voting mayoritas (2/3) + auto-retry untuk UNKNOWN")
     print()
     print(f"  {Fore.LIGHTBLACK_EX}Output: 2 file terpisah (Tidak Terbanned & Sudah Terbanned){Style.RESET_ALL}")
     print(f"  {Fore.LIGHTBLACK_EX}Format input: {Style.RESET_ALL}{Fore.WHITE}.txt / .json{Style.RESET_ALL}"
@@ -1795,14 +1855,12 @@ def verif_3x_bulk():
         pause()
         return
 
-    # Cek ekstensi
     lower = filepath.lower()
     if not (lower.endswith(".txt") or lower.endswith(".json")):
         print(f"\n  {Fore.RED}✖ File harus berekstensi .txt atau .json{Style.RESET_ALL}")
         pause()
         return
 
-    # Cek ukuran file (max 20 MB)
     try:
         fsize = os.path.getsize(filepath)
     except Exception as e:
@@ -1818,7 +1876,6 @@ def verif_3x_bulk():
         pause()
         return
 
-    # Baca device ID
     try:
         devices = load_devices_from_file_verif(filepath)
     except ValueError as e:
@@ -1835,7 +1892,6 @@ def verif_3x_bulk():
         pause()
         return
 
-    # Threads config
     try:
         t_input = input(
             f"\n  {Fore.CYAN}Jumlah threads [{VERIF_THREADS}]: {Style.RESET_ALL}"
@@ -1851,12 +1907,10 @@ def verif_3x_bulk():
     print(f"  {Fore.LIGHTBLACK_EX}│{Style.RESET_ALL} 📄 File      : {Fore.WHITE}{os.path.basename(filepath)}{Style.RESET_ALL}")
     print(f"  {Fore.LIGHTBLACK_EX}│{Style.RESET_ALL} 📱 Total ID  : {Fore.CYAN}{total}{Style.RESET_ALL}")
     print(f"  {Fore.LIGHTBLACK_EX}│{Style.RESET_ALL} 🧵 Threads   : {Fore.CYAN}{threads}{Style.RESET_ALL}")
+    print(f"  {Fore.LIGHTBLACK_EX}│{Style.RESET_ALL} 🔁 Retry     : {Fore.CYAN}{VERIF_RETRY}x per device{Style.RESET_ALL}")
     print(f"  {Fore.LIGHTBLACK_EX}│{Style.RESET_ALL} 📦 Max size  : {Fore.CYAN}20 MB{Style.RESET_ALL}")
     print()
 
-    # ═════════════════════════════════════════════════════════════════
-    # EKSEKUSI 3X SCAN
-    # ═════════════════════════════════════════════════════════════════
     scan_results: List[Dict[str, dict]] = []
     for i in (1, 2, 3):
         header = {
@@ -1882,11 +1936,8 @@ def verif_3x_bulk():
         print(f"    {Fore.LIGHTBLACK_EX}•{Style.RESET_ALL} ✅ Clean   : {Fore.GREEN}{cnt_clean}{Style.RESET_ALL}")
         print(f"    {Fore.LIGHTBLACK_EX}•{Style.RESET_ALL} ⚠️  Unknown : {Fore.YELLOW}{cnt_unknown}{Style.RESET_ALL}")
 
-    # ═════════════════════════════════════════════════════════════════
-    # BANDINGKAN HASIL 3 SCAN
-    # ═════════════════════════════════════════════════════════════════
     print()
-    print(f"  {Fore.CYAN}📊 Membandingkan hasil 3 scan...{Style.RESET_ALL}")
+    print(f"  {Fore.CYAN}📊 Membandingkan hasil 3 scan (voting mayoritas)...{Style.RESET_ALL}")
 
     file_clean: List[Tuple[str, dict]] = []
     file_banned: List[Tuple[str, str]] = []
@@ -1898,37 +1949,17 @@ def verif_3x_bulk():
         s2 = scan_results[1].get(d) or {}
         s3 = scan_results[2].get(d) or {}
 
-        v1 = bool(s1.get("valid"))
-        v2 = bool(s2.get("valid"))
-        v3 = bool(s3.get("valid"))
-        b1 = s1.get("ban_status")
-        b2 = s2.get("ban_status")
-        b3 = s3.get("ban_status")
+        verdict, payload = _verif_decide_single(s1, s2, s3)
 
-        # Wajib valid di ketiga scan
-        if not (v1 and v2 and v3):
+        if verdict == "CLEAN":
+            file_clean.append((d, payload or {}))
+        elif verdict == "BANNED":
+            file_banned.append((d, _verif_ban_line(d, payload)))
+        elif verdict == "INVALID":
             invalid_final.append(d)
-            continue
-
-        # Semua CLEAN = verified clean
-        if b1 == "CLEAN" and b2 == "CLEAN" and b3 == "CLEAN":
-            data = s3.get("data") or s2.get("data") or s1.get("data") or {}
-            file_clean.append((d, data))
-        # Semua BANNED = verified banned
-        elif b1 == "BANNED" and b2 == "BANNED" and b3 == "BANNED":
-            ban_str = (
-                s3.get("ban_string")
-                or s2.get("ban_string")
-                or s1.get("ban_string")
-            )
-            file_banned.append((d, _verif_ban_line(d, ban_str)))
         else:
-            reason = f"scan1={b1}, scan2={b2}, scan3={b3}"
-            inconsistent.append((d, reason))
+            inconsistent.append((d, payload or "unknown"))
 
-    # ═════════════════════════════════════════════════════════════════
-    # SUSUN FILE HASIL (2 FILE TERPISAH)
-    # ═════════════════════════════════════════════════════════════════
     now = datetime.datetime.now()
     tanggal = now.strftime("%Y-%m-%d")
     waktu = now.strftime("%H-%M-%S")
@@ -1942,7 +1973,6 @@ def verif_3x_bulk():
     path1 = out_dir / fname1
     path2 = out_dir / fname2
 
-    # ── FILE 1 — TIDAK TERBANNED ─────────────────────────────────
     with path1.open("w", encoding="utf-8") as f:
         f.write("═" * 60 + "\n")
         f.write("WEIRDMARKET — DEVICE ID TIDAK TERBANNED\n")
@@ -1979,7 +2009,6 @@ def verif_3x_bulk():
             for d_id in invalid_final:
                 f.write(f"{d_id}\n")
 
-    # ── FILE 2 — SUDAH TERBANNED ─────────────────────────────────
     with path2.open("w", encoding="utf-8") as f:
         f.write("═" * 60 + "\n")
         f.write("WEIRDMARKET — DEVICE ID SUDAH TERBANNED\n")
@@ -1997,9 +2026,6 @@ def verif_3x_bulk():
         if not file_banned:
             f.write("(Tidak ada device yang terverifikasi banned)\n")
 
-    # ═════════════════════════════════════════════════════════════════
-    # TAMPILKAN HASIL
-    # ═════════════════════════════════════════════════════════════════
     print()
     print(f"  {Fore.MAGENTA}{Style.BRIGHT}╔══════════════════════════════════════════════════════════════╗{Style.RESET_ALL}")
     print(f"  {Fore.MAGENTA}{Style.BRIGHT}║{Style.RESET_ALL} {Fore.WHITE}{Style.BRIGHT}{'🏁  4 VERIFIKASI LANGKAH — SELESAI':<60}{Style.RESET_ALL} {Fore.MAGENTA}{Style.BRIGHT}║{Style.RESET_ALL}")
@@ -2031,8 +2057,7 @@ def verif_menu():
         print(f"    {Fore.CYAN}🔄 Scan 2{Style.RESET_ALL} → Cek Valid  →  {Fore.RED}🚫{Style.RESET_ALL} Cek Banned")
         print(f"    {Fore.CYAN}✅ Scan 3{Style.RESET_ALL} → Cek Valid  →  {Fore.RED}🚫{Style.RESET_ALL} Cek Banned")
         print()
-        print(f"  {Fore.LIGHTBLACK_EX}Hasil per device dibandingkan antar 3 scan.{Style.RESET_ALL}")
-        print(f"  {Fore.LIGHTBLACK_EX}Hanya status yang KONSISTEN yang divalidasi ke file.{Style.RESET_ALL}")
+        print(f"  {Fore.LIGHTBLACK_EX}Voting mayoritas (2/3) + auto-retry UNKNOWN (3x).{Style.RESET_ALL}")
         print()
         print(f"  {Fore.CYAN}[1]{Style.RESET_ALL}  📦 BULK 3X SCAN  {Fore.LIGHTBLACK_EX}(TXT / JSON, max 20 MB){Style.RESET_ALL}")
         print(f"  {Fore.LIGHTBLACK_EX}[0]{Style.RESET_ALL}  BACK")
@@ -2110,7 +2135,7 @@ def main_menu():
             f"  {Fore.YELLOW}{Style.BRIGHT}[3]{Style.RESET_ALL}  {TITLE}SPLIT / DEVICE MANAGER{Style.RESET_ALL}"
             f" {MUTED}Full info, Device ID, Android & iOS{Style.RESET_ALL}\n"
             f"  {Fore.MAGENTA}{Style.BRIGHT}[4]{Style.RESET_ALL}  {TITLE}4 VERIFIKASI LANGKAH — 3X SCAN{Style.RESET_ALL}"
-            f" {MUTED}Valid + Banned · 3 pass verifikasi{Style.RESET_ALL}\n"
+            f" {MUTED}Valid + Banned · voting mayoritas{Style.RESET_ALL}\n"
             f"  {Fore.RED}{Style.BRIGHT}[0]{Style.RESET_ALL}  {TITLE}KELUAR{Style.RESET_ALL}"
         )
         footer()
@@ -2258,7 +2283,6 @@ async def bot_edit_or_send(update, context, text, kb=None, parse_mode="Markdown"
             return None
 
 
-# ── Bot: wrappers sync ──────────────────────────────────────────────
 def _bot_run_valid_single(device_id: str):
     try:
         return GameLogin(device_id).run()
@@ -2273,7 +2297,6 @@ def _bot_run_ban_single(device_id: str):
         return "UNKNOWN", device_id
 
 
-# ── Bot: Command handlers ───────────────────────────────────────────
 async def bot_cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
     if not bot_is_owner(u.id):
@@ -2303,7 +2326,6 @@ async def bot_cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "❌ Dibatalkan.", reply_markup=bot_back_kb())
 
 
-# ── Bot: Button router ──────────────────────────────────────────────
 async def bot_button_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -2335,7 +2357,6 @@ async def bot_button_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await bot_show_split_input(update, context, data)
 
 
-# ── Bot: menu displays ──────────────────────────────────────────────
 async def bot_show_main(update, context):
     text = (
         "🌟 *WEIRDMARKET TELEGRAM BOT* 🌟\n"
@@ -2380,10 +2401,7 @@ async def bot_show_verif(update, context):
         "  🔍 Scan 1 → Cek Valid ✅ + Cek Banned 🚫\n"
         "  🔄 Scan 2 → Ulangi Cek Valid ✅ + Cek Banned 🚫\n"
         "  ✅ Scan 3 → Verifikasi akhir ✅ + 🚫\n\n"
-        "📊 *Perbandingan Hasil:*\n"
-        "Ketiga hasil scan akan dibandingkan per device ID.\n"
-        "Device yang *konsisten* di semua scan dianggap terverifikasi.\n"
-        "Jika berbeda → ditandai *tidak konsisten*.\n\n"
+        "📊 *Voting Mayoritas (2/3) + Auto Retry UNKNOWN (3x)*\n\n"
         "📁 *Hasil Akhir (2 file terpisah):*\n"
         "  ✅ `Device ID Tidak Terbanned [tanggal] [waktu]`\n"
         "  🚫 `Device ID Sudah Terbanned [tanggal] [waktu]`\n\n"
@@ -2462,6 +2480,7 @@ async def bot_show_verif_bulk(update, context):
         "📦 Max 20 MB\n\n"
         "Bot akan otomatis menjalankan 3 scan berturut-turut:\n"
         "  🔍 Valid → 🚫 Banned → 🔄 ulangi → ✅ verifikasi akhir\n\n"
+        "📊 Voting mayoritas (2/3) + auto-retry UNKNOWN.\n\n"
         "⚡ Langsung eksekusi setelah file dikirim.",
         kb=bot_cancel_kb())
 
@@ -2486,7 +2505,6 @@ async def bot_show_split_input(update, context, mode):
         kb=bot_cancel_kb())
 
 
-# ── Bot: text handler ───────────────────────────────────────────────
 async def bot_on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
     if not bot_is_owner(u.id):
@@ -2558,7 +2576,6 @@ async def bot_on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
 
-# ── Bot: document handler ───────────────────────────────────────────
 async def bot_on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
     if not bot_is_owner(u.id):
@@ -2635,6 +2652,7 @@ async def bot_on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📄 File : `{doc.file_name}`\n"
             f"📱 Total: `{len(devices)}` device\n"
             f"🧵 Threads: `{VERIF_THREADS}`\n"
+            f"🔁 Retry: `{VERIF_RETRY}x`\n"
             f"📦 Max: `20 MB`\n\n"
             f"🔄 *SCAN 1/3 — Cek Valid...*",
             parse_mode="Markdown")
@@ -2661,7 +2679,6 @@ async def bot_on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await bot_do_split(update, context, clean, duplicates, mode, size, msg)
         return
 
-    # Fallback: file dikirim tanpa state
     devices = read_device_ids_from_text_verif(text)
     if devices:
         await update.message.reply_text(
@@ -2678,7 +2695,6 @@ async def bot_on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=bot_back_kb())
 
 
-# ── Bot: bulk valid runner ──────────────────────────────────────────
 async def bot_bulk_valid(update, context, uid, devices, msg):
     cid = msg.chat_id
     total = len(devices)
@@ -2783,7 +2799,6 @@ async def bot_bulk_valid(update, context, uid, devices, msg):
         pass
 
 
-# ── Bot: bulk ban runner ────────────────────────────────────────────
 async def bot_bulk_ban(update, context, uid, devices, msg):
     cid = msg.chat_id
     total = len(devices)
@@ -2891,7 +2906,6 @@ async def bot_bulk_ban(update, context, uid, devices, msg):
         pass
 
 
-# ── Bot: 3x verif runner ────────────────────────────────────────────
 async def bot_verif_3x(update, context, uid, devices, msg):
     cid = msg.chat_id
     total = len(devices)
@@ -2911,13 +2925,13 @@ async def bot_verif_3x(update, context, uid, devices, msg):
                       f"━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
                       f"🔄 *{header}*\n\n"
                       f"📱 Total: `{total}` device\n"
-                      f"🧵 Threads: `{VERIF_THREADS}`\n\n"
+                      f"🧵 Threads: `{VERIF_THREADS}`\n"
+                      f"🔁 Retry: `{VERIF_RETRY}x`\n\n"
                       f"⏳ Menjalankan Cek Valid + Cek Banned..."),
                 parse_mode="Markdown")
         except Exception:
             pass
 
-        # _verif_single_scan mencetak progress ke stdout (log), tetap return map
         res = await loop.run_in_executor(
             None, _verif_single_scan, devices, i, VERIF_THREADS)
         scan_results.append(res)
@@ -2942,13 +2956,12 @@ async def bot_verif_3x(update, context, uid, devices, msg):
             pass
         await asyncio.sleep(0.5)
 
-    # Bandingkan
     try:
         await context.bot.edit_message_text(
             chat_id=cid, message_id=msg.message_id,
             text=("⚡ *4 VERIFIKASI LANGKAH — 3X SCAN*\n"
                   "━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                  "📊 *Membandingkan hasil 3 scan...*"),
+                  "📊 *Membandingkan hasil 3 scan (voting mayoritas)...*"),
             parse_mode="Markdown")
     except Exception:
         pass
@@ -2963,30 +2976,16 @@ async def bot_verif_3x(update, context, uid, devices, msg):
         s2 = scan_results[1].get(d) or {}
         s3 = scan_results[2].get(d) or {}
 
-        v1 = bool(s1.get("valid"))
-        v2 = bool(s2.get("valid"))
-        v3 = bool(s3.get("valid"))
-        b1 = s1.get("ban_status")
-        b2 = s2.get("ban_status")
-        b3 = s3.get("ban_status")
+        verdict, payload = _verif_decide_single(s1, s2, s3)
 
-        if not (v1 and v2 and v3):
+        if verdict == "CLEAN":
+            file_clean.append((d, payload or {}))
+        elif verdict == "BANNED":
+            file_banned.append((d, _verif_ban_line(d, payload)))
+        elif verdict == "INVALID":
             invalid_final.append(d)
-            continue
-
-        if b1 == "CLEAN" and b2 == "CLEAN" and b3 == "CLEAN":
-            data = s3.get("data") or s2.get("data") or s1.get("data") or {}
-            file_clean.append((d, data))
-        elif b1 == "BANNED" and b2 == "BANNED" and b3 == "BANNED":
-            ban_str = (
-                s3.get("ban_string")
-                or s2.get("ban_string")
-                or s1.get("ban_string")
-            )
-            file_banned.append((d, _verif_ban_line(d, ban_str)))
         else:
-            reason = f"scan1={b1}, scan2={b2}, scan3={b3}"
-            inconsistent.append((d, reason))
+            inconsistent.append((d, payload or "unknown"))
 
     now = datetime.datetime.now()
     tanggal = now.strftime("%Y-%m-%d")
@@ -2996,7 +2995,6 @@ async def bot_verif_3x(update, context, uid, devices, msg):
     fname1 = f"Device ID Tidak Terbanned {tanggal} {waktu}.txt"
     fname2 = f"Device ID Sudah Terbanned {tanggal} {waktu}.txt"
 
-    # ── FILE 1 ──
     buf1 = io.StringIO()
     buf1.write("═" * 60 + "\n")
     buf1.write("WEIRDMARKET — DEVICE ID TIDAK TERBANNED\n")
@@ -3031,7 +3029,6 @@ async def bot_verif_3x(update, context, uid, devices, msg):
         for d_id in invalid_final:
             buf1.write(f"{d_id}\n")
 
-    # ── FILE 2 ──
     buf2 = io.StringIO()
     buf2.write("═" * 60 + "\n")
     buf2.write("WEIRDMARKET — DEVICE ID SUDAH TERBANNED\n")
@@ -3052,7 +3049,6 @@ async def bot_verif_3x(update, context, uid, devices, msg):
     out1 = io.BytesIO(buf1.getvalue().encode("utf-8"))
     out2 = io.BytesIO(buf2.getvalue().encode("utf-8"))
 
-    # Send File 1
     try:
         await context.bot.send_document(
             chat_id=cid,
@@ -3068,7 +3064,6 @@ async def bot_verif_3x(update, context, uid, devices, msg):
     except Exception as e:
         print(f"[BOT VERIF3X] send file1 err: {e}")
 
-    # Send File 2
     try:
         await context.bot.send_document(
             chat_id=cid,
@@ -3081,7 +3076,6 @@ async def bot_verif_3x(update, context, uid, devices, msg):
     except Exception as e:
         print(f"[BOT VERIF3X] send file2 err: {e}")
 
-    # Final edit
     try:
         await context.bot.edit_message_text(
             chat_id=cid, message_id=msg.message_id,
@@ -3098,7 +3092,6 @@ async def bot_verif_3x(update, context, uid, devices, msg):
         pass
 
 
-# ── Bot: split runner ───────────────────────────────────────────────
 async def bot_do_split(update, context, clean, duplicates, mode, size, msg):
     cid = msg.chat_id
     out_dir = RESULTS / "split_bot"
@@ -3173,7 +3166,6 @@ async def bot_do_split(update, context, clean, duplicates, mode, size, msg):
                 f"🗑️ Duplikat: `{duplicates}`",
                 parse_mode="Markdown", reply_markup=bot_back_kb())
 
-        # Zip & send
         try:
             zip_path = out_dir / "_all_split.zip"
             with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -3191,7 +3183,6 @@ async def bot_do_split(update, context, clean, duplicates, mode, size, msg):
         await msg.edit_text(f"❌ Error: {e}", reply_markup=bot_back_kb())
 
 
-# ── Bot: post_init & runner ─────────────────────────────────────────
 async def bot_post_init(app):
     try:
         await app.bot.delete_webhook(drop_pending_updates=True)
@@ -3212,6 +3203,7 @@ def run_telegram_bot():
     print(f"Token   : {BOT_TOKEN[:20]}...")
     print(f"Owner   : {OWNER_ID}")
     print(f"MaxFile : {MAX_FILE_SIZE // 1024 // 1024} MB")
+    print(f"Threads : {VERIF_THREADS} | Retry: {VERIF_RETRY}x")
     print("=" * 60)
 
     app = Application.builder().token(BOT_TOKEN).post_init(bot_post_init).build()
