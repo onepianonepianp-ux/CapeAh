@@ -1,8 +1,18 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+
 """
-WEIRDMARKET TELEGRAM BOT — Combined Checker (FULL + FULLCHECK + 4-STEP VERIFY)
-Created by: WEIRDMARKET
+WEIRDMARKET - Combined Checker (100% VALID)
+Fitur:
+  1. CEK VALID  - Single & Bulk (sampai game server + role info)
+  2. CEK BAN    - Single & Bulk
+  3. SPLIT / DEVICE MANAGER
+  4. 4 VERIFIKASI LANGKAH - 3X SCAN  ← NEW
+  5. TELEGRAM BOT  ← NEW
+  6. EXIT
+
+Logic valid: login server -> game server -> request role info
+Client version: 2.2.16.1232.1 (sama dengan bot BF)
 """
 
 import socket
@@ -11,56 +21,66 @@ import zstandard as zstd
 import datetime
 import struct
 import os
-import re
-import io
 import json
-import asyncio
-import logging
-import threading
 import time
+import asyncio
+import io
 import zipfile
+import logging
+import concurrent.futures
+import threading
+import re
 from pathlib import Path
 from enum import Enum
 from typing import Any, Tuple, Optional, List, Dict
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
+from rich.console import Console
+from rich.prompt import Prompt, IntPrompt
+from rich.table import Table
 from Crypto.Cipher import AES
+from colorama import init, Fore, Style, Back
 
-import telegram
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
-from telegram.ext import (
-    Application, CommandHandler, CallbackQueryHandler,
-    MessageHandler, filters, ContextTypes, ConversationHandler
-)
+init(autoreset=True)
 
-BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "8824575468:AAGWZRWE41AVnl7n7tbyzp3dah1xbm1cQ-0")
-OWNER_ID = int(os.getenv("TG_CHAT_ID", "7601958159"))
+console = Console()
 
+# ── DEVICE/SPLIT CONFIG ─────────────────────────────────────────────
 DEVICE_RE = re.compile(r"(?i)(?:and_|ios_)[A-Za-z0-9_-]+")
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-RESULTS = Path(BASE_DIR) / "results"
-os.makedirs(RESULTS, exist_ok=True)
+RESULTS = Path(__file__).resolve().parent / "results"
 
-BULK_THREADS = 30
+# ── FITUR 4 CONFIG ──────────────────────────────────────────────────
 MAX_FILE_SIZE = 20 * 1024 * 1024  # 20 MB
-FULLCHECK_BATCH_SIZE = 1000
+VERIF_THREADS = 20
+
+# ── GLOBAL MODE FLAGS ────────────────────────────────────────────────
+DEBUG_MODE = False
+RESULTS_FILE = "results_weiRd.txt"
+
+
+# ── DEBUG HELPERS ────────────────────────────────────────────────────
+def dbg(label, data=None, color=Fore.MAGENTA):
+    if not DEBUG_MODE:
+        return
+    ts = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
+    if data is None:
+        print(f"{color}[DBG {ts}] {label}{Style.RESET_ALL}")
+    else:
+        print(f"{color}[DBG {ts}] {label}{Style.RESET_ALL}")
+        if isinstance(data, (bytes, bytearray)):
+            hex_str = data.hex()
+            for i in range(0, len(hex_str), 64):
+                print(f"  {Fore.CYAN}{hex_str[i:i+64]}{Style.RESET_ALL}")
+        elif isinstance(data, dict):
+            for k, v in data.items():
+                print(f"  {Fore.CYAN}[{k}] => {repr(v)[:120]}{Style.RESET_ALL}")
+        else:
+            print(f"  {Fore.CYAN}{repr(data)[:200]}{Style.RESET_ALL}")
+
 
 AES_KEY = bytes.fromhex('f5a193d50ade553e9835595f5cd75ddd')
 AES_IV = b'\x00' * 16
-CLIENT_VERSION = '2.2.16.1232.1'
-
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO
-)
-logger = logging.getLogger(__name__)
-for _l in ("httpx", "telegram", "telegram.ext"):
-    logging.getLogger(_l).setLevel(logging.WARNING)
 
 
-# ══════════════════════════════════════════════════════════════════════
-# SDP
-# ══════════════════════════════════════════════════════════════════════
 class SdpDataType(Enum):
     INTEGER_POSITIVE = 0
     INTEGER_NEGATIVE = 1
@@ -183,15 +203,19 @@ class SdpStruct(dict):
             if tag == 15:
                 tag = self._read_number()
             if data_type == SdpDataType.INTEGER_POSITIVE:
-                return tag, self._read_number()
+                value = self._read_number()
+                return tag, value
             elif data_type == SdpDataType.INTEGER_NEGATIVE:
-                return tag, -self._read_number()
+                value = -self._read_number()
+                return tag, value
             elif data_type == SdpDataType.FLOAT:
                 value = self._read_number().to_bytes(4, 'little')
-                return tag, struct.unpack("<f", value)[0]
+                value = struct.unpack("<f", value)[0]
+                return tag, value
             elif data_type == SdpDataType.DOUBLE:
                 value = self._read_number().to_bytes(8, 'little')
-                return tag, struct.unpack("<d", value)[0]
+                value = struct.unpack("<d", value)[0]
+                return tag, value
             elif data_type == SdpDataType.STRING:
                 length = self._read_number()
                 try:
@@ -230,10 +254,10 @@ class SdpStruct(dict):
         except Exception:
             raise SdpException("Error unpacking data")
 
+    def __repr__(self):
+        return f"SdpStruct({dict(self)})"
 
-# ══════════════════════════════════════════════════════════════════════
-# BASE CONNECTION
-# ══════════════════════════════════════════════════════════════════════
+
 class BaseConnection:
     def __init__(self, host, port):
         self.host = host
@@ -249,18 +273,21 @@ class BaseConnection:
 
     def cleanup(self):
         if self.socket:
-            try:
-                self.socket.close()
-            except Exception:
-                pass
+            self.socket.close()
             self.sequence = 1
             self.socket = None
 
     def send_data(self, id, sdp):
-        packet = SdpStruct({0: id, 1: self.sequence, 5: sdp.data}).data
+        packet = SdpStruct({
+            0: id,
+            1: self.sequence,
+            5: sdp.data
+        }).data
         buf = zstd.compress(packet)
         flags = (len(buf) + 4) | (16 << 24)
         buf = flags.to_bytes(4, 'big') + buf
+        dbg(f"SEND  packet_id={id}  seq={self.sequence}  payload_bytes={len(sdp.data)}  compressed={len(buf)}")
+        dbg("      SDP fields", dict(sdp))
         self.socket.send(buf)
         self.sequence += 1
 
@@ -271,16 +298,20 @@ class BaseConnection:
                 if not data:
                     return None, None
                 self.queue_data += data
+
             flags = int.from_bytes(self.queue_data[:4], 'big')
             size = flags & 0xFFFFFF
             compression_type = flags >> 24
+
             while len(self.queue_data) < size:
                 data = self.socket.recv(4096)
                 if not data:
                     return None, None
                 self.queue_data += data
+
             data = self.queue_data[4:size]
             self.queue_data = self.queue_data[size:]
+
             if compression_type == 1:
                 data = zlib.decompress(data)
             elif compression_type == 16:
@@ -293,14 +324,21 @@ class BaseConnection:
                     data = zlib.decompress(data)
                 elif compression_type == 18:
                     data = zstd.decompress(data)
+
             result = SdpStruct(data)
             id = result.get(0)
             if id is None:
                 return None, None
+
             res = result.get(6) or result.get(5)
             if not res or not isinstance(res, bytes):
                 return id, None
-            return id, SdpStruct(res)
+
+            parsed_res = SdpStruct(res)
+            dbg(f"RECV  id={id}  body_bytes={len(res)}  compression_type={compression_type}", color=Fore.CYAN)
+            dbg("      SDP fields", dict(parsed_res), color=Fore.CYAN)
+            return id, parsed_res
+
         except socket.timeout:
             return -1, None
         except Exception:
@@ -314,12 +352,12 @@ def map_rank(p):
     if p is None:
         return "Unknown"
     R = [
-        (0, 4, "Warrior III"), (5, 9, "Warrior II"), (10, 14, "Warrior I"),
-        (15, 19, "Elite IV"), (20, 24, "Elite III"), (25, 29, "Elite II"), (30, 34, "Elite I"),
-        (35, 39, "Master IV"), (40, 44, "Master III"), (45, 49, "Master II"), (50, 54, "Master I"),
-        (55, 59, "Grandmaster IV"), (60, 64, "Grandmaster III"), (65, 69, "Grandmaster II"), (70, 74, "Grandmaster I"),
-        (75, 81, "Epic IV"), (82, 88, "Epic III"), (89, 95, "Epic II"), (96, 107, "Epic I"),
-        (108, 114, "Legend IV"), (115, 121, "Legend III"), (122, 128, "Legend II"), (129, 135, "Legend I"),
+        (0,4,"Warrior III"),(5,9,"Warrior II"),(10,14,"Warrior I"),
+        (15,19,"Elite IV"),(20,24,"Elite III"),(25,29,"Elite II"),(30,34,"Elite I"),
+        (35,39,"Master IV"),(40,44,"Master III"),(45,49,"Master II"),(50,54,"Master I"),
+        (55,59,"Grandmaster IV"),(60,64,"Grandmaster III"),(65,69,"Grandmaster II"),(70,74,"Grandmaster I"),
+        (75,81,"Epic IV"),(82,88,"Epic III"),(89,95,"Epic II"),(96,107,"Epic I"),
+        (108,114,"Legend IV"),(115,121,"Legend III"),(122,128,"Legend II"),(129,135,"Legend I"),
     ]
     for mn, mx, r in R:
         if mn <= p <= mx:
@@ -332,12 +370,13 @@ def map_rank(p):
 
 
 # ══════════════════════════════════════════════════════════════════════
-# GAME LOGIN
+# GAME LOGIN — 100% VALID (sampai game server + role info)
 # ══════════════════════════════════════════════════════════════════════
 class GameLogin(BaseConnection):
     def __init__(self, device_id):
         super().__init__('login.ml.youngjoygame.com', 30021)
         self.device_id = device_id
+
         parts = self.device_id.split('_')
         if len(parts) >= 2:
             device_info = parts[1]
@@ -355,8 +394,9 @@ class GameLogin(BaseConnection):
             self.imei_md5 = device_id
             self.android_id = ""
             self.advertising_id = ""
+
         self.channel = 'and_usa'
-        self.client_version = CLIENT_VERSION
+        self.client_version = '2.2.16.1232.1'  # ← SAMA dengan bot BF
         self.account_id = 0
         self.session_key = ''
         self.zone_id = 0
@@ -409,11 +449,17 @@ class GameLogin(BaseConnection):
         self.host = self.game_server_host
         self.port = self.game_server_port
         self.connect()
+
         self.send_data(10001, SdpStruct({
-            0: self.account_id, 1: self.session_key, 2: self.zone_id,
-            4: self.client_version, 13: self.channel, 15: self.device_id
+            0: self.account_id,
+            1: self.session_key,
+            2: self.zone_id,
+            4: self.client_version,
+            13: self.channel,
+            15: self.device_id
         }))
         self.send_data(10101, SdpStruct({0: 0, 2: 2}))
+
         while True:
             pid, res = self.recv_data()
             if pid is None:
@@ -515,19 +561,39 @@ class GameLogin(BaseConnection):
         return None
 
     def run(self):
+        """Login server -> game server -> role info.
+        Returns dict with data, or None if fail.
+        """
         try:
             self.connect()
+            dbg(f"LOGIN SERVER → sending packet 1  device_id={self.device_id[:30]}...")
+
             if not self.login_to_login_server():
+                dbg(f"LOGIN FAILED", color=Fore.RED)
                 return None
+
+            dbg(f"LOGIN OK  account_id={self.account_id}  zone_id={self.zone_id}", color=Fore.GREEN)
+
             if not self.get_game_server():
+                dbg(f"GAME SERVER FAILED", color=Fore.RED)
                 return None
+
+            dbg(f"GAME SERVER OK  {self.game_server_host}:{self.game_server_port}", color=Fore.GREEN)
+
             if not self.connect_to_game_server():
+                dbg(f"CONNECT GAME SERVER FAILED", color=Fore.RED)
                 return None
+
+            dbg(f"CONNECTED TO GAME SERVER", color=Fore.GREEN)
+
+            # Request role info
             role_info = None
             try:
                 role_info = self.get_skin_role_info(self.account_id, self.zone_id)
-            except Exception:
-                pass
+            except Exception as e:
+                dbg(f"ROLE INFO FAILED: {e}", color=Fore.YELLOW)
+
+            # Coba lookup player untuk dapat nickname, level, dll.
             pdata = None
             try:
                 result = self.lookup_player(self.account_id, "id")
@@ -547,8 +613,9 @@ class GameLogin(BaseConnection):
                     if role_info:
                         pdata["hero_count"] = role_info.get(9, pdata["hero_count"])
                         pdata["matches"] = role_info.get(22, pdata["matches"])
-            except Exception:
-                pass
+            except Exception as e:
+                dbg(f"LOOKUP FAILED: {e}", color=Fore.YELLOW)
+
             return {
                 "account_id": self.account_id,
                 "zone_id": self.zone_id,
@@ -558,15 +625,15 @@ class GameLogin(BaseConnection):
                 "player_data": pdata,
                 "kick": self.kick_detected,
             }
-        except Exception:
+
+        except Exception as e:
+            dbg(f"ERROR: {str(e)}", color=Fore.RED)
             return None
         finally:
             self.cleanup()
 
 
-# ══════════════════════════════════════════════════════════════════════
-# BAN CHECKER
-# ══════════════════════════════════════════════════════════════════════
+# ── BAN CHECKER NETWORK CONNECTION ───────────────────────────────────
 class BanCheckerConnection:
     def __init__(self, device_id: str):
         self.host = 'login.ml.youngjoygame.com'
@@ -575,10 +642,12 @@ class BanCheckerConnection:
         self.socket = None
         self.queue_data = b''
         self.device_id = device_id
+
         parts = device_id.split('_')
         device_info = parts[1] if len(parts) >= 2 else device_id
         if len(parts) >= 3 and len(device_info) < 32:
             device_info = device_info + "_" + parts[2]
+
         if len(device_info) >= 32:
             self.imei_md5 = device_info[:32]
             self.android_id = device_info[32:48] if len(device_info) >= 48 else ""
@@ -587,8 +656,9 @@ class BanCheckerConnection:
             self.imei_md5 = device_id
             self.android_id = ""
             self.advertising_id = ""
+
         self.channel = 'and_usa'
-        self.client_version = CLIENT_VERSION
+        self.client_version = '2.2.16.1232.1'  # ← SAMA dengan bot BF
         self.account_id = 0
         self.session_key = ''
         self.zone_id = 0
@@ -606,15 +676,16 @@ class BanCheckerConnection:
 
     def cleanup(self):
         if self.socket:
-            try:
-                self.socket.close()
-            except Exception:
-                pass
+            self.socket.close()
             self.sequence = 1
             self.socket = None
 
     def send_data(self, pkt_id, sdp):
-        packet = SdpStruct({0: pkt_id, 1: self.sequence, 5: sdp.data}).data
+        packet = SdpStruct({
+            0: pkt_id,
+            1: self.sequence,
+            5: sdp.data
+        }).data
         buf = zstd.compress(packet)
         flags = (len(buf) + 4) | (16 << 24)
         buf = flags.to_bytes(4, 'big') + buf
@@ -628,16 +699,20 @@ class BanCheckerConnection:
                 if not data:
                     return None, None
                 self.queue_data += data
+
             flags = int.from_bytes(self.queue_data[:4], 'big')
             size = flags & 0xFFFFFF
             compression_type = flags >> 24
+
             while len(self.queue_data) < size:
                 data = self.socket.recv(4096)
                 if not data:
                     return None, None
                 self.queue_data += data
+
             data = self.queue_data[4:size]
             self.queue_data = self.queue_data[size:]
+
             if compression_type == 1:
                 data = zlib.decompress(data)
             elif compression_type == 16:
@@ -650,20 +725,25 @@ class BanCheckerConnection:
                     data = zlib.decompress(data)
                 elif compression_type == 18:
                     data = zstd.decompress(data)
+
             result = SdpStruct(data)
             pkt_id = result.get(0)
             if pkt_id is None:
                 return None, None
+
             res = result.get(6) or result.get(5)
             if not res or not isinstance(res, bytes):
                 return pkt_id, None
+
             return pkt_id, SdpStruct(res)
+
         except socket.timeout:
             return -1, None
         except Exception:
             return None, None
 
 
+# ── BAN REASON MAPPING ───────────────────────────────────────────────
 BAN_REASONS = {
     "21": "Using Plug-in Apps to Compromise Competitive Fairness",
 }
@@ -672,6 +752,7 @@ BAN_REASONS = {
 def inspect_for_ban(pkt_id, sdp_data):
     is_banned = False
     details = {}
+
     if sdp_data:
         def scan(obj):
             if isinstance(obj, dict):
@@ -679,8 +760,7 @@ def inspect_for_ban(pkt_id, sdp_data):
                     if k == 'ban_reason':
                         code_str = str(v)
                         details['ban_code'] = code_str
-                        details['reason_name'] = BAN_REASONS.get(
-                            code_str, "Using Plug-in Apps to Compromise Competitive Fairness")
+                        details['reason_name'] = BAN_REASONS.get(code_str, "Using Plug-in Apps to Compromise Competitive Fairness")
                     elif k in ('ban_status', 'ban_time') or (isinstance(k, str) and 'ban' in k.lower()):
                         details[str(k)] = v
                     if k == 'endtime_day': details['endtime_day'] = v
@@ -690,13 +770,226 @@ def inspect_for_ban(pkt_id, sdp_data):
                     if isinstance(v, (dict, list)): scan(v)
             elif isinstance(obj, list):
                 for item in obj: scan(item)
+
         scan(dict(sdp_data))
+
     if 'endtime_day' in details and details['endtime_day'] is not None:
         is_banned = True
+
     return is_banned, details
 
 
-def format_ban_string(device_id, ban_info):
+# ── UI DASAR ──────────────────────────────────────────────────────────
+APP_NAME = "WEIRD TOOLS"
+APP_CREDIT = "WEIRDMARKET"
+APP_VERSION = "v2.3"
+UI_WIDTH = 76
+
+ACCENT = Fore.CYAN
+ACCENT_2 = Fore.MAGENTA
+TITLE = Fore.WHITE + Style.BRIGHT
+MUTED = Fore.LIGHTBLACK_EX
+SUCCESS = Fore.GREEN + Style.BRIGHT
+WARNING = Fore.YELLOW + Style.BRIGHT
+DANGER = Fore.RED + Style.BRIGHT
+
+
+def clear_screen():
+    os.system("cls" if os.name == "nt" else "clear")
+
+
+def line(char="─", width=UI_WIDTH, color=MUTED):
+    print(f"{color}{char * width}{Style.RESET_ALL}")
+
+
+def center(text, color=Fore.WHITE, bold=False, width=UI_WIDTH):
+    style = Style.BRIGHT if bold else ""
+    print(f"{color}{style}{text[:width].center(width)}{Style.RESET_ALL}")
+
+
+def _big_weird_tools():
+    art = [
+        "██╗    ██╗███████╗██╗██████╗ ██████╗",
+        "██║    ██║██╔════╝██║██╔══██╗██╔══██╗",
+        "██║ █╗ ██║█████╗  ██║██████╔╝██║  ██║",
+        "██║███╗██║██╔══╝  ██║██╔══██╗██║  ██║",
+        "╚███╔███╔╝███████╗██║██║  ██║██████╔╝",
+        " ╚══╝╚══╝ ╚══════╝╚═╝╚═╝  ╚═╝╚═════╝ ",
+        "        ████████╗ ██████╗  ██████╗ ██╗     ███████╗",
+        "        ╚══██╔══╝██╔═══██╗██╔═══██╗██║     ██╔════╝",
+        "           ██║   ██║   ██║██║   ██║██║     ███████╗",
+        "           ██║   ██║   ██║██║   ██║██║     ╚════██║",
+        "           ██║   ╚██████╔╝╚██████╔╝███████╗███████║",
+        "           ╚═╝    ╚═════╝  ╚═════╝ ╚══════╝╚══════╝",
+    ]
+    for row in art:
+        center(row, Fore.CYAN, True)
+
+
+def section(title):
+    print()
+    print(f"{ACCENT}╭{'─' * (UI_WIDTH - 2)}╮{Style.RESET_ALL}")
+    print(f"{ACCENT}│{Style.RESET_ALL} {TITLE}{title:<{UI_WIDTH - 4}}{Style.RESET_ALL} {ACCENT}│{Style.RESET_ALL}")
+    print(f"{ACCENT}╰{'─' * (UI_WIDTH - 2)}╯{Style.RESET_ALL}")
+
+
+def footer():
+    print()
+    line("─", UI_WIDTH, Fore.LIGHTBLACK_EX)
+    center(f"{APP_CREDIT}  •  {APP_NAME} {APP_VERSION}", Fore.LIGHTBLACK_EX)
+    line("─", UI_WIDTH, Fore.LIGHTBLACK_EX)
+
+
+def pause():
+    print()
+    input(f"{MUTED}Press {Fore.WHITE}[ENTER]{MUTED} to continue...{Style.RESET_ALL}")
+
+
+def banner():
+    clear_screen()
+    print()
+    print(f"{ACCENT_2}╭{'═' * (UI_WIDTH - 2)}╮{Style.RESET_ALL}")
+    _big_weird_tools()
+    print(f"{ACCENT_2}├{'═' * (UI_WIDTH - 2)}┤{Style.RESET_ALL}")
+    center("WEIRDMARKET  •  OFFICIAL TOOLS", Fore.MAGENTA, True)
+    center("VALID / BAN CHECKER", Fore.CYAN, True)
+    center(APP_VERSION, Fore.LIGHTBLACK_EX)
+    print(f"{ACCENT_2}╰{'═' * (UI_WIDTH - 2)}╯{Style.RESET_ALL}")
+
+
+# ══════════════════════════════════════════════════════════════════════
+# VALID MODE — 100% VALID
+# ══════════════════════════════════════════════════════════════════════
+def save_valid_result(device_id, data):
+    """Simpan hasil valid ke file."""
+    result_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "VALID_RESULTS.txt")
+    pd = data.get("player_data") or {}
+    with open(result_file, "a", encoding="utf-8") as f:
+        f.write(
+            f"DEVICE ID  : {device_id}\n"
+            f"ACCOUNT ID : {data.get('account_id')}\n"
+            f"ZONE ID    : {data.get('zone_id')}\n"
+            f"NICKNAME   : {pd.get('nickname', '-')}\n"
+            f"LEVEL      : {pd.get('level', 0)}\n"
+            f"SKIN       : {pd.get('skin_count', 0)}\n"
+            f"HERO       : {pd.get('hero_count', 0)}\n"
+            f"RANK       : {pd.get('current_rank', '-')}\n"
+            f"HIGH RANK  : {pd.get('high_rank', '-')}\n"
+            f"{'-' * 58}\n"
+        )
+
+
+def print_valid_card(device_id, data):
+    """Tampilkan card valid yang rapi."""
+    pd = data.get("player_data") or {}
+    width = UI_WIDTH
+    inner = width - 2
+    device_display = device_id if len(device_id) <= inner - 14 else device_id[:inner - 17] + "..."
+
+    print()
+    print(f"{Fore.GREEN}╭{'━' * inner}╮{Style.RESET_ALL}")
+    print(f"{Fore.GREEN}│{Style.RESET_ALL}{Fore.GREEN}{Style.BRIGHT}{'✓  VALID HIT'.center(inner)}{Style.RESET_ALL}{Fore.GREEN}│{Style.RESET_ALL}")
+    print(f"{Fore.GREEN}├{'─' * inner}┤{Style.RESET_ALL}")
+    print(f"{Fore.GREEN}│{Style.RESET_ALL} {Fore.LIGHTBLACK_EX}DEVICE ID{Style.RESET_ALL}  {Fore.WHITE}{device_display}{Style.RESET_ALL}" + ' ' * max(0, inner - 12 - len(device_display)) + f"{Fore.GREEN}│{Style.RESET_ALL}")
+    print(f"{Fore.GREEN}│{Style.RESET_ALL} {Fore.LIGHTBLACK_EX}ACCOUNT ID{Style.RESET_ALL} {Fore.CYAN}{Style.BRIGHT}{data.get('account_id')}{Style.RESET_ALL}" + ' ' * max(0, inner - 13 - len(str(data.get('account_id')))) + f"{Fore.GREEN}│{Style.RESET_ALL}")
+    print(f"{Fore.GREEN}│{Style.RESET_ALL} {Fore.LIGHTBLACK_EX}ZONE ID{Style.RESET_ALL}    {Fore.CYAN}{Style.BRIGHT}{data.get('zone_id')}{Style.RESET_ALL}" + ' ' * max(0, inner - 13 - len(str(data.get('zone_id')))) + f"{Fore.GREEN}│{Style.RESET_ALL}")
+    if pd:
+        print(f"{Fore.GREEN}├{'─' * inner}┤{Style.RESET_ALL}")
+        print(f"{Fore.GREEN}│{Style.RESET_ALL} {Fore.LIGHTBLACK_EX}NICKNAME{Style.RESET_ALL}   {Fore.WHITE}{pd.get('nickname', '-')}{Style.RESET_ALL}" + ' ' * max(0, inner - 13 - len(str(pd.get('nickname', '-')))) + f"{Fore.GREEN}│{Style.RESET_ALL}")
+        print(f"{Fore.GREEN}│{Style.RESET_ALL} {Fore.LIGHTBLACK_EX}LEVEL{Style.RESET_ALL}      {Fore.WHITE}{pd.get('level', 0)}{Style.RESET_ALL}" + ' ' * max(0, inner - 13 - len(str(pd.get('level', 0)))) + f"{Fore.GREEN}│{Style.RESET_ALL}")
+        print(f"{Fore.GREEN}│{Style.RESET_ALL} {Fore.LIGHTBLACK_EX}SKIN{Style.RESET_ALL}       {Fore.WHITE}{pd.get('skin_count', 0)}{Style.RESET_ALL}" + ' ' * max(0, inner - 13 - len(str(pd.get('skin_count', 0)))) + f"{Fore.GREEN}│{Style.RESET_ALL}")
+        print(f"{Fore.GREEN}│{Style.RESET_ALL} {Fore.LIGHTBLACK_EX}HERO{Style.RESET_ALL}       {Fore.WHITE}{pd.get('hero_count', 0)}{Style.RESET_ALL}" + ' ' * max(0, inner - 13 - len(str(pd.get('hero_count', 0)))) + f"{Fore.GREEN}│{Style.RESET_ALL}")
+        print(f"{Fore.GREEN}│{Style.RESET_ALL} {Fore.LIGHTBLACK_EX}RANK{Style.RESET_ALL}       {Fore.WHITE}{pd.get('current_rank', '-')}{Style.RESET_ALL}" + ' ' * max(0, inner - 13 - len(str(pd.get('current_rank', '-')))) + f"{Fore.GREEN}│{Style.RESET_ALL}")
+    print(f"{Fore.GREEN}├{'─' * inner}┤{Style.RESET_ALL}")
+    saved = "✓  SAVED  •  VALID_RESULTS.txt"
+    print(f"{Fore.GREEN}│{Style.RESET_ALL}{Fore.YELLOW}{saved.center(inner)}{Style.RESET_ALL}{Fore.GREEN}│{Style.RESET_ALL}")
+    print(f"{Fore.GREEN}╰{'━' * inner}╯{Style.RESET_ALL}")
+
+
+def valid_single():
+    banner()
+    section("◈  CEK VALID • SINGLE")
+    device_id = input(
+        f"\n  {Fore.MAGENTA}WEIRD{Style.RESET_ALL} "
+        f"{Fore.CYAN}❯{Style.RESET_ALL} DEVICE ID\n"
+        f"  {Fore.YELLOW}➤ {Style.RESET_ALL}"
+    ).strip()
+
+    if not device_id:
+        print(f"\n  {Fore.RED}✖ ERROR: No Device ID entered.{Style.RESET_ALL}")
+        pause()
+        return
+
+    print(f"\n  {Fore.MAGENTA}◌{Style.RESET_ALL} Checking valid status...")
+    bot = GameLogin(device_id)
+    data = bot.run()
+
+    if data and data.get("account_id") and data.get("zone_id"):
+        save_valid_result(device_id, data)
+        print_valid_card(device_id, data)
+    else:
+        print(f"\n  {Fore.RED}✖ LOGIN / VALIDATION FAILED{Style.RESET_ALL}")
+
+    footer()
+    pause()
+
+
+def valid_bulk():
+    banner()
+    section("◈  CEK VALID • BULK")
+    filepath = input(
+        f"\n  {Fore.CYAN}FILE PATH{Style.RESET_ALL}\n  "
+        f"{Fore.YELLOW}➤ {Style.RESET_ALL}"
+    ).strip().replace('"', '')
+
+    if not os.path.exists(filepath):
+        print(f"\n  {Fore.RED}✖ File not found.{Style.RESET_ALL}")
+        pause()
+        return
+
+    device_ids = read_device_ids_from_file(filepath)
+
+    if not device_ids:
+        print(f"\n  {Fore.RED}✖ File is empty.{Style.RESET_ALL}")
+        pause()
+        return
+
+    valid_count = 0
+    fail_count = 0
+    total = len(device_ids)
+
+    print()
+    for i, dev_id in enumerate(device_ids, 1):
+        print(f"  {Fore.CYAN}[{i:>4}/{total:<4}]{Style.RESET_ALL} {dev_id[:52]}")
+        try:
+            bot = GameLogin(dev_id)
+            data = bot.run()
+            if data and data.get("account_id") and data.get("zone_id"):
+                valid_count += 1
+                save_valid_result(dev_id, data)
+                pd = data.get("player_data") or {}
+                print(f"     {Fore.GREEN}✓ VALID{Style.RESET_ALL}  "
+                      f"Acc: {data.get('account_id')} | Zone: {data.get('zone_id')} | "
+                      f"Skin: {pd.get('skin_count', 0)} | Rank: {pd.get('current_rank', '-')}")
+            else:
+                fail_count += 1
+                print(f"     {Fore.RED}✖ FAILED{Style.RESET_ALL}")
+        except Exception as e:
+            fail_count += 1
+            print(f"     {Fore.RED}✖ ERROR: {e}{Style.RESET_ALL}")
+
+    section("◈  VALID BULK COMPLETE")
+    print(f"\n  {Fore.GREEN}✓ VALID  : {valid_count}{Style.RESET_ALL}")
+    print(f"  {Fore.RED}✖ FAILED : {fail_count}{Style.RESET_ALL}")
+    print(f"  {Fore.CYAN}◉ TOTAL  : {total}{Style.RESET_ALL}")
+    footer()
+    pause()
+
+
+# ══════════════════════════════════════════════════════════════════════
+# BAN MODE
+# ══════════════════════════════════════════════════════════════════════
+def format_ban_string(device_id: str, ban_info: dict) -> str:
     reason = ban_info.get('reason_name', 'Using Plug-in Apps to Compromise Competitive Fairness')
     day = ban_info.get('endtime_day')
     hour = ban_info.get('endtime_hour', '00')
@@ -705,7 +998,7 @@ def format_ban_string(device_id, ban_info):
     return f"{device_id} |  Reason Name: {reason} |  Duration: Day {day}, {hour}:{minute}:{sec}"
 
 
-def check_device_ban_silent(device_id):
+def check_device_ban_silent(device_id: str) -> Tuple[str, str]:
     conn = BanCheckerConnection(device_id)
     try:
         conn.connect('login.ml.youngjoygame.com', 30021)
@@ -716,9 +1009,11 @@ def check_device_ban_silent(device_id):
             3: conn.channel,
             4: 'en'
         }))
+
         pkt_id, res = conn.recv_data()
         banned, ban_info = inspect_for_ban(pkt_id, res)
         if banned: return "BANNED", format_ban_string(device_id, ban_info)
+
         if pkt_id == 2 and res:
             conn.account_id = res.get(0)
             conn.session_key = res.get(1)
@@ -729,32 +1024,40 @@ def check_device_ban_silent(device_id):
             else: conn.zone_id = zone_data or 0
         else:
             return "UNKNOWN", device_id
+
         conn.send_data(5, SdpStruct({
             0: conn.account_id, 1: conn.session_key, 2: conn.client_version,
             5: conn.zone_id, 6: conn.channel
         }))
+
         pkt_id, res = conn.recv_data()
         banned, ban_info = inspect_for_ban(pkt_id, res)
         if banned: return "BANNED", format_ban_string(device_id, ban_info)
+
         if pkt_id == 6 and res:
             game_server = res[1]
             conn.game_server_host, conn.game_server_port = game_server.split(':')
             conn.game_server_port = int(conn.game_server_port)
         else:
             return "UNKNOWN", device_id
+
         conn.cleanup()
         conn.connect(conn.game_server_host, conn.game_server_port)
+
         conn.send_data(10001, SdpStruct({
             0: conn.account_id, 1: conn.session_key, 2: conn.zone_id,
             4: conn.client_version, 13: conn.channel, 15: conn.device_id
         }))
         conn.send_data(10101, SdpStruct({0: 0, 2: 2}))
+
         role_requested = False
         while True:
             pkt_id, res = conn.recv_data()
             banned, ban_info = inspect_for_ban(pkt_id, res)
+
             if banned:
                 return "BANNED", format_ban_string(device_id, ban_info)
+
             if pkt_id is None or pkt_id == -1:
                 return "UNKNOWN", device_id
             elif pkt_id == 10002 and not role_requested:
@@ -771,26 +1074,213 @@ def check_device_ban_silent(device_id):
         conn.cleanup()
 
 
+# ── THREADING & BULK LOGIC ──────────────────────────────────────────
+progress_lock = threading.Lock()
+file_lock = threading.Lock()
+processed_count = 0
+banned_count = 0
+clean_count = 0
+total_count = 0
+
+
+def update_progress():
+    global processed_count, banned_count, clean_count, total_count
+    with progress_lock:
+        total = max(total_count, 1)
+        done = min(processed_count, total_count)
+        pct = (done / total) * 100
+        bar_width = 18
+        filled = int(bar_width * done / total)
+        bar = "━" * filled + "─" * (bar_width - filled)
+
+        border = Fore.LIGHTBLACK_EX
+        title = Fore.CYAN + Style.BRIGHT
+        accent = Fore.CYAN + Style.BRIGHT
+        neutral = Fore.WHITE + Style.BRIGHT
+        muted = Fore.LIGHTBLACK_EX
+        warning = Fore.YELLOW + Style.BRIGHT
+        danger = Fore.RED + Style.BRIGHT
+
+        dashboard = (
+            f"{border}│{Style.RESET_ALL} "
+            f"{title}WEIRD TOOLS{Style.RESET_ALL} "
+            f"{muted}• BULK CHECK{Style.RESET_ALL} "
+            f"{neutral}{done}/{total_count}{Style.RESET_ALL} "
+            f"{accent}{bar}{Style.RESET_ALL} "
+            f"{warning}{pct:5.1f}%{Style.RESET_ALL} "
+            f"{muted}│{Style.RESET_ALL} "
+            f"{neutral}CHECKED {done}{Style.RESET_ALL} "
+            f"{muted}│{Style.RESET_ALL} "
+            f"{accent}NOT BAN {clean_count}{Style.RESET_ALL} "
+            f"{muted}│{Style.RESET_ALL} "
+            f"{danger}BAN {banned_count}{Style.RESET_ALL}"
+        )
+        print("\r\033[2K" + dashboard, end="", flush=True)
+
+
+def process_device_worker(device_id: str, ban_filepath: str, clean_filepath: str):
+    global processed_count, banned_count, clean_count
+
+    status, result_str = check_device_ban_silent(device_id)
+
+    with file_lock:
+        if status == "BANNED":
+            banned_count += 1
+            with open(ban_filepath, "a", encoding="utf-8") as f:
+                f.write(result_str + "\n")
+        elif status == "CLEAN":
+            clean_count += 1
+            with open(clean_filepath, "a", encoding="utf-8") as f:
+                f.write(result_str + "\n")
+        elif status == "UNKNOWN":
+            with open(os.path.join(os.path.dirname(ban_filepath), "UNKNOWN.txt"), "a", encoding="utf-8") as f:
+                f.write(result_str + "\n")
+
+        processed_count += 1
+
+    update_progress()
+
+
+def run_bulk_mode():
+    global processed_count, banned_count, clean_count, total_count
+    processed_count = 0
+    banned_count = 0
+    clean_count = 0
+
+    print(f"\n{Fore.YELLOW}--- BULK CHECK MODE ---{Style.RESET_ALL}")
+
+    filepath = input(f"{Fore.CYAN}Enter filepath containing Device IDs: {Style.RESET_ALL}").strip()
+    if not os.path.exists(filepath):
+        print(f"{Fore.RED}File not found!{Style.RESET_ALL}")
+        return
+
+    try:
+        threads_input = int(input(f"{Fore.CYAN}Enter number of threads (1-20 max): {Style.RESET_ALL}").strip())
+        threads = max(1, min(20, threads_input))
+    except ValueError:
+        threads = 1
+        print(f"{Fore.YELLOW}Invalid input, defaulting to 1 thread.{Style.RESET_ALL}")
+
+    with open(filepath, "r", encoding="utf-8") as f:
+        device_ids = [line.strip() for line in f if line.strip()]
+
+    total_count = len(device_ids)
+    if total_count == 0:
+        print(f"{Fore.RED}No valid Device IDs found in file.{Style.RESET_ALL}")
+        return
+
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    save_dir = os.path.join(base_dir, "ban_results")
+    os.makedirs(save_dir, exist_ok=True)
+    ban_file = os.path.join(save_dir, "BAN 100%.txt")
+    clean_file = os.path.join(save_dir, "NOT BAN 100%.txt")
+
+    print(f"{Fore.CYAN}╭────────────────────────────────────────────────────────────────────╮{Style.RESET_ALL}")
+    print(f"{Fore.CYAN}│{Style.RESET_ALL} {Fore.YELLOW}⚡ BULK CHECK INITIALIZED{Style.RESET_ALL}   "
+          f"{Fore.LIGHTBLACK_EX}Threads:{Style.RESET_ALL} {Fore.WHITE}{threads}{Style.RESET_ALL}"
+          f" {Fore.CYAN}│{Style.RESET_ALL}")
+    print(f"{Fore.CYAN}╰────────────────────────────────────────────────────────────────────╯{Style.RESET_ALL}\n")
+    update_progress()
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as executor:
+        futures = [
+            executor.submit(process_device_worker, d_id, ban_file, clean_file)
+            for d_id in device_ids
+        ]
+        for future in futures:
+            try:
+                future.result()
+            except Exception as e:
+                print(f"\\n{Fore.RED}Worker error: {type(e).__name__}: {e}{Style.RESET_ALL}")
+
+    print(f"\n{Fore.LIGHTBLACK_EX}╭────────────────────────────────────────────────────────────────────╮{Style.RESET_ALL}")
+    print(f"{Fore.LIGHTBLACK_EX}│{Style.RESET_ALL} {Fore.WHITE}{Style.BRIGHT}BULK CHECK COMPLETE{Style.RESET_ALL}"
+          f" {Fore.LIGHTBLACK_EX}│{Style.RESET_ALL}")
+    print(f"{Fore.LIGHTBLACK_EX}╰────────────────────────────────────────────────────────────────────╯{Style.RESET_ALL}")
+    unknown_file = os.path.join(save_dir, "UNKNOWN.txt")
+    print(
+        f"Results saved to:\n"
+        f"- {ban_file}\n"
+        f"- {clean_file}\n"
+        f"- {unknown_file}\n"
+    )
+    print(
+        f"{Fore.WHITE}Summary: {Fore.GREEN}{clean_count} NOT BAN"
+        f"{Fore.WHITE} | {Fore.RED}{banned_count} BAN"
+        f"{Fore.WHITE} | {Fore.YELLOW}{total_count - clean_count - banned_count} UNKNOWN/ERROR"
+        f"{Style.RESET_ALL}"
+    )
+
+
+def check_device_ban(device_id: str):
+    print(f"\n  {Fore.MAGENTA}◌{Style.RESET_ALL} Checking ban status...")
+    status, result = check_device_ban_silent(device_id)
+
+    if status == "BANNED":
+        print(f"\n  {Fore.RED}{Style.BRIGHT}✖ BANNED{Style.RESET_ALL}")
+        print(f"  {Fore.WHITE}{result}{Style.RESET_ALL}")
+    elif status == "CLEAN":
+        print(f"\n  {Fore.GREEN}{Style.BRIGHT}✓ NOT BANNED{Style.RESET_ALL}")
+        print(f"  {Fore.WHITE}{result}{Style.RESET_ALL}")
+    else:
+        print(f"\n  {Fore.YELLOW}{Style.BRIGHT}⚠ UNKNOWN / CHECK FAILED{Style.RESET_ALL}")
+        print(f"  {Fore.WHITE}{result}{Style.RESET_ALL}")
+
+    return status, result
+
+
+def ban_single():
+    banner()
+    section("◈  CEK BAN • SINGLE")
+    device_id = input(
+        f"\n  {Fore.CYAN}DEVICE ID{Style.RESET_ALL}\n  "
+        f"{Fore.YELLOW}➤ {Style.RESET_ALL}"
+    ).strip()
+
+    if not device_id:
+        print(f"\n  {Fore.RED}✖ No Device ID entered.{Style.RESET_ALL}")
+        pause()
+        return
+
+    check_device_ban(device_id)
+    pause()
+
+
 # ══════════════════════════════════════════════════════════════════════
-# PARSER
+# SPLIT / DEVICE MANAGER
 # ══════════════════════════════════════════════════════════════════════
-def extract_records(text):
+def normalize(line: str) -> str:
+    raw = (line or "").strip()
+    if not raw:
+        return ""
+    match = re.search(r"(?i)(?:and_|ios_)[A-Za-z0-9_-]+", raw)
+    if not match:
+        return ""
+    candidate = match.group(0)
+    return candidate if DEVICE_RE.fullmatch(candidate) else ""
+
+
+def extract_records(text: str):
     text = text or ""
     blocks = re.split(r"(?m)^\s*---\s*$", text)
     records = []
     id_pattern = re.compile(r"(?i)(?:and_|ios_)[A-Za-z0-9_-]+")
+
     for block in blocks:
         block = block.strip()
         if not block:
             continue
+
         lines = block.splitlines()
         id_lines = []
         for idx, line in enumerate(lines):
             m = id_pattern.search(line)
             if m and DEVICE_RE.fullmatch(m.group(0)):
                 id_lines.append((idx, m.group(0)))
+
         if not id_lines:
             continue
+
         if len(id_lines) > 1:
             for n, (start_idx, device_id) in enumerate(id_lines):
                 end_idx = id_lines[n + 1][0] if n + 1 < len(id_lines) else len(lines)
@@ -811,6 +1301,7 @@ def extract_records(text):
                 if record_text:
                     records.append({"id": device_id, "text": record_text})
             continue
+
         start_idx, device_id = id_lines[0]
         cleaned = []
         for line in lines[start_idx:]:
@@ -824,10 +1315,24 @@ def extract_records(text):
                 if re.fullmatch(r"\s*(?:\d+[.)]\s*|[-*]\s*)?", prefix):
                     line = line[m.start():]
             cleaned.append(line)
+
         record_text = "\n".join(cleaned).strip()
         if record_text:
             records.append({"id": device_id, "text": record_text})
+
     return records
+
+
+def load_records(path: str):
+    p = Path(path)
+    if not p.is_file():
+        raise FileNotFoundError(path)
+    with p.open("r", encoding="utf-8-sig", errors="ignore") as f:
+        return extract_records(f.read())
+
+
+def load_file(path: str):
+    return [r["id"] for r in load_records(path)]
 
 
 def unique_records_keep_order(records):
@@ -844,13 +1349,194 @@ def unique_records_keep_order(records):
     return out, duplicates
 
 
-def read_device_ids_from_text(text):
+def unique_keep_order(items):
+    seen = set()
+    out = []
+    duplicates = 0
+    for item in items:
+        key = item.lower()
+        if key in seen:
+            duplicates += 1
+            continue
+        seen.add(key)
+        out.append(item)
+    return out, duplicates
+
+
+def save_numbered_records(path: Path, records):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        for i, record in enumerate(records, 1):
+            lines = record["text"].splitlines()
+            if lines:
+                f.write(f"{i}. {lines[0]}\n")
+                for line in lines[1:]:
+                    f.write(line + "\n")
+            f.write("---\n")
+
+
+def save_plain_records(path: Path, records):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        for record in records:
+            f.write(record["text"].rstrip() + "\n")
+            f.write("---\n")
+
+
+def read_device_ids_from_file(filepath):
+    records = load_records(filepath)
+    clean, _ = unique_records_keep_order(records)
+    return [r["id"] for r in clean]
+
+
+def export_all_records(records):
+    RESULTS.mkdir(exist_ok=True)
+    android = [r for r in records if r["id"].lower().startswith("and_")]
+    ios = [r for r in records if r["id"].lower().startswith("ios_")]
+    save_numbered_records(RESULTS / "all_devices.txt", records)
+    save_numbered_records(RESULTS / "android_and.txt", android)
+    save_numbered_records(RESULTS / "ios.txt", ios)
+    console.print("[green]✓[/green] results/all_devices.txt")
+    console.print("[green]✓[/green] results/android_and.txt")
+    console.print("[green]✓[/green] results/ios.txt")
+
+
+def split_record_files(records, size=50):
+    RESULTS.mkdir(exist_ok=True)
+    split_dir = RESULTS / "parts"
+    split_dir.mkdir(exist_ok=True)
+    for old in split_dir.glob("part_*.txt"):
+        old.unlink()
+    total_parts = 0
+    for start in range(0, len(records), size):
+        total_parts += 1
+        chunk = records[start:start + size]
+        save_numbered_records(split_dir / f"part_{total_parts:03d}.txt", chunk)
+    console.print(
+        f"[green]✓[/green] {len(records)} record dibagi menjadi "
+        f"{total_parts} file di {split_dir}/"
+    )
+
+
+def split_manager_menu():
+    while True:
+        banner()
+        section("◈  SPLIT / DEVICE MANAGER")
+        print(
+            f"\n  {Fore.CYAN}[1]{Style.RESET_ALL}  SPLIT FULL INFO"
+            f"\n  {Fore.CYAN}[2]{Style.RESET_ALL}  SPLIT DEVICE ID"
+            f"\n  {Fore.CYAN}[3]{Style.RESET_ALL}  SPLIT DEVICE ID • ANDROID / iOS"
+            f"\n  {Fore.CYAN}[4]{Style.RESET_ALL}  DEDUP + EXPORT FULL INFO"
+            f"\n  {Fore.LIGHTBLACK_EX}[0]{Style.RESET_ALL}  BACK"
+        )
+        choice = input(f"\n{Fore.CYAN}Pilih menu [0-4]: {Style.RESET_ALL}").strip()
+
+        if choice == "0":
+            return
+
+        if choice not in {"1", "2", "3", "4"}:
+            print(f"{Fore.RED}Pilihan tidak valid.{Style.RESET_ALL}")
+            pause()
+            continue
+
+        filepath = input(
+            f"\n{Fore.CYAN}FILE TXT{Style.RESET_ALL}\n"
+            f"{Fore.YELLOW}➤ {Style.RESET_ALL}"
+        ).strip().strip('"').strip("'")
+
+        try:
+            records = load_records(filepath)
+        except Exception as e:
+            print(f"\n{Fore.RED}Gagal membaca file: {e}{Style.RESET_ALL}")
+            pause()
+            continue
+
+        clean, duplicates = unique_records_keep_order(records)
+
+        if not clean:
+            print(f"\n{Fore.RED}Tidak ada Device ID valid (and_/ios_).{Style.RESET_ALL}")
+            pause()
+            continue
+
+        try:
+            size = int(input(
+                f"{Fore.CYAN}Jumlah ID per file [default 50]: {Style.RESET_ALL}"
+            ).strip() or "50")
+        except ValueError:
+            size = 50
+        size = max(1, size)
+
+        out_dir = RESULTS / "split"
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        for old in out_dir.glob("*.txt"):
+            old.unlink()
+
+        def write_chunks(items, prefix, full_info=False):
+            total_parts = 0
+            for start_i in range(0, len(items), size):
+                total_parts += 1
+                chunk = items[start_i:start_i + size]
+                path = out_dir / f"{prefix}_{total_parts:03d}.txt"
+                with path.open("w", encoding="utf-8") as f:
+                    for idx, item in enumerate(chunk, start=1):
+                        if full_info:
+                            lines = item["text"].splitlines()
+                            if lines:
+                                f.write(f"{idx}. {lines[0]}\n")
+                                for line in lines[1:]:
+                                    f.write(line + "\n")
+                            f.write("---\n")
+                        else:
+                            f.write(item + "\n")
+            return total_parts
+
+        if choice == "1":
+            parts = write_chunks(clean, "full_info", full_info=True)
+            print(f"\n{Fore.GREEN}✓ Split FULL INFO selesai: {parts} file{Style.RESET_ALL}")
+
+        elif choice == "2":
+            ids = [r["id"] for r in clean]
+            parts = write_chunks(ids, "device_id")
+            print(f"\n{Fore.GREEN}✓ Split DEVICE ID selesai: {parts} file{Style.RESET_ALL}")
+
+        elif choice == "3":
+            ids_and = [r["id"] for r in clean if r["id"].lower().startswith("and_")]
+            ids_ios = [r["id"] for r in clean if r["id"].lower().startswith("ios_")]
+            parts_and = write_chunks(ids_and, "android_and")
+            parts_ios = write_chunks(ids_ios, "ios")
+            print(
+                f"\n{Fore.GREEN}✓ Android: {len(ids_and)} ID / {parts_and} file"
+                f"\n✓ iOS: {len(ids_ios)} ID / {parts_ios} file"
+                f"\n✓ Output: {out_dir}{Style.RESET_ALL}"
+            )
+
+        elif choice == "4":
+            export_all_records(clean)
+            print(
+                f"\n{Fore.GREEN}✓ Export full info selesai"
+                f"\n✓ Total unik: {len(clean)}"
+                f"\n✓ Duplikat dihapus: {duplicates}{Style.RESET_ALL}"
+            )
+
+        pause()
+
+
+# ══════════════════════════════════════════════════════════════════════
+# FITUR NOMOR 4 — 4 VERIFIKASI LANGKAH (3X SCAN)
+# ══════════════════════════════════════════════════════════════════════
+def read_device_ids_from_text_verif(text: str) -> List[str]:
+    """
+    Baca device ID dari text (TXT atau JSON), dedup, urutkan sesuai kemunculan.
+    """
     text = text or ""
     stripped = text.strip()
+    # Coba parse JSON lebih dulu
     if stripped.startswith("[") or stripped.startswith("{"):
         try:
             data = json.loads(stripped)
-            found = []
+            found: List[str] = []
+
             def walk_json(o):
                 if isinstance(o, str):
                     if DEVICE_RE.fullmatch(o.strip()):
@@ -861,6 +1547,7 @@ def read_device_ids_from_text(text):
                 elif isinstance(o, list):
                     for v in o:
                         walk_json(v)
+
             walk_json(data)
             if found:
                 seen, out = set(), []
@@ -873,38 +1560,633 @@ def read_device_ids_from_text(text):
                 return out
         except Exception:
             pass
+
+    # Fallback TXT
     records = extract_records(text)
     clean, _ = unique_records_keep_order(records)
     return [r["id"] for r in clean]
 
 
+def load_devices_from_file_verif(filepath: str) -> List[str]:
+    """
+    Baca device ID dari file TXT/JSON dengan batas ukuran 20 MB.
+    """
+    p = Path(filepath)
+    if not p.is_file():
+        raise FileNotFoundError(filepath)
+    size = p.stat().st_size
+    if size > MAX_FILE_SIZE:
+        raise ValueError(
+            f"Ukuran file {size / 1024 / 1024:.2f} MB melebihi batas maksimal 20 MB"
+        )
+    with p.open("r", encoding="utf-8-sig", errors="ignore") as f:
+        text = f.read()
+    return read_device_ids_from_text_verif(text)
+
+
+def _verif_single_scan(
+    devices: List[str],
+    scan_no: int,
+    threads: int,
+) -> Dict[str, dict]:
+    """
+    Menjalankan SATU siklus scan lengkap: Valid -> Banned.
+    Menggunakan mekanisme ASLI:
+      - Cek Valid  : GameLogin(device_id).run()
+      - Cek Banned : check_device_ban_silent(device_id)
+    Return:
+        { device_id: {
+              "valid": bool,
+              "ban_status": "BANNED" | "CLEAN" | "UNKNOWN" | None,
+              "ban_string": str | None,
+              "data": dict | None
+          } }
+    """
+    total = len(devices)
+    valid_devs: List[Tuple[str, dict]] = []
+    invalid_devs: List[str] = []
+
+    v_lock = threading.Lock()
+    done_v = [0]
+    last_v = [0.0]
+
+    # ── LANGKAH 1: CEK VALID ──────────────────────────────────────
+    def worker_v(d):
+        try:
+            return d, GameLogin(d).run()
+        except Exception:
+            return d, None
+
+    def bulk_valid():
+        with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as ex:
+            futures = {ex.submit(worker_v, d): d for d in devices}
+            for fut in concurrent.futures.as_completed(futures):
+                try:
+                    d, data = fut.result()
+                except Exception:
+                    d, data = futures[fut], None
+                with v_lock:
+                    if data and data.get("account_id") and data.get("zone_id"):
+                        valid_devs.append((d, data))
+                    else:
+                        invalid_devs.append(d)
+                    done_v[0] += 1
+
+    print()
+    print(f"  {Fore.CYAN}╭─ SCAN {scan_no}/3 ─ 🔍 LANGKAH 1 : CEK VALID ─────────────────{Style.RESET_ALL}")
+    vf = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    v_future = vf.submit(bulk_valid)
+    while not v_future.done():
+        now = time.time()
+        if now - last_v[0] >= 0.8:
+            last_v[0] = now
+            done = done_v[0]
+            pct = (done / max(total, 1)) * 100
+            bw = 22
+            fill = int(bw * done / max(total, 1))
+            bar = "━" * fill + "─" * (bw - fill)
+            sys_out = (
+                f"\r  {Fore.LIGHTBLACK_EX}│{Style.RESET_ALL} "
+                f"{Fore.CYAN}{bar}{Style.RESET_ALL} "
+                f"{Fore.YELLOW}{pct:5.1f}%{Style.RESET_ALL} "
+                f"{Fore.WHITE}{done}/{total}{Style.RESET_ALL} "
+                f"{Fore.GREEN}✓ {len(valid_devs)}{Style.RESET_ALL} "
+                f"{Fore.RED}✗ {len(invalid_devs)}{Style.RESET_ALL}"
+            )
+            print(sys_out, end="", flush=True)
+        time.sleep(0.2)
+    try:
+        v_future.result()
+    except Exception:
+        pass
+    vf.shutdown(wait=False)
+    print()
+
+    # ── LANGKAH 2: CEK BANNED ─────────────────────────────────────
+    ban_map: Dict[str, Tuple[str, str]] = {}
+    if valid_devs:
+        tb = len(valid_devs)
+        b_lock = threading.Lock()
+        done_b = [0]
+        last_b = [0.0]
+
+        def worker_b(dev):
+            try:
+                return check_device_ban_silent(dev)
+            except Exception:
+                return "UNKNOWN", dev
+
+        def bulk_ban():
+            with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as ex:
+                futures = {ex.submit(worker_b, d): d for d, _ in valid_devs}
+                for fut in concurrent.futures.as_completed(futures):
+                    try:
+                        status, result = fut.result()
+                    except Exception:
+                        status, result = "UNKNOWN", futures[fut]
+                    with b_lock:
+                        ban_map[futures[fut]] = (status, result)
+                        done_b[0] += 1
+
+        print(f"  {Fore.CYAN}╰─ 🚫 LANGKAH 2 : CEK BANNED ─────────────────────────────────{Style.RESET_ALL}")
+        bf = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        b_future = bf.submit(bulk_ban)
+        while not b_future.done():
+            now = time.time()
+            if now - last_b[0] >= 0.8:
+                last_b[0] = now
+                done = done_b[0]
+                pct = (done / max(tb, 1)) * 100
+                bw = 22
+                fill = int(bw * done / max(tb, 1))
+                bar = "━" * fill + "─" * (bw - fill)
+                banned_so_far = sum(1 for v in ban_map.values() if v[0] == "BANNED")
+                clean_so_far = sum(1 for v in ban_map.values() if v[0] == "CLEAN")
+                print(
+                    f"\r  {Fore.LIGHTBLACK_EX}│{Style.RESET_ALL} "
+                    f"{Fore.CYAN}{bar}{Style.RESET_ALL} "
+                    f"{Fore.YELLOW}{pct:5.1f}%{Style.RESET_ALL} "
+                    f"{Fore.WHITE}{done}/{tb}{Style.RESET_ALL} "
+                    f"{Fore.RED}🚫 {banned_so_far}{Style.RESET_ALL} "
+                    f"{Fore.GREEN}✓ {clean_so_far}{Style.RESET_ALL}",
+                    end="", flush=True,
+                )
+            time.sleep(0.2)
+        try:
+            b_future.result()
+        except Exception:
+            pass
+        bf.shutdown(wait=False)
+        print()
+
+    # ── Build result map ─────────────────────────────────────────
+    result: Dict[str, dict] = {}
+    for d in devices:
+        result[d] = {
+            "valid": False,
+            "ban_status": None,
+            "ban_string": None,
+            "data": None,
+        }
+    for d, data in valid_devs:
+        result[d]["valid"] = True
+        result[d]["data"] = data
+    for d, (st, st_str) in ban_map.items():
+        if d in result:
+            result[d]["ban_status"] = st
+            result[d]["ban_string"] = st_str
+    return result
+
+
+def _verif_format_clean_record(device_id: str, data: dict) -> str:
+    """Format record untuk device valid + clean (mengikuti format save_valid_result)."""
+    pd = (data or {}).get("player_data") or {}
+    return (
+        f"DEVICE ID  : {device_id}\n"
+        f"ACCOUNT ID : {(data or {}).get('account_id', '-')}\n"
+        f"ZONE ID    : {(data or {}).get('zone_id', '-')}\n"
+        f"NICKNAME   : {pd.get('nickname', '-')}\n"
+        f"LEVEL      : {pd.get('level', 0)}\n"
+        f"SKIN       : {pd.get('skin_count', 0)}\n"
+        f"HERO       : {pd.get('hero_count', 0)}\n"
+        f"RANK       : {pd.get('current_rank', '-')}\n"
+        f"HIGH RANK  : {pd.get('high_rank', '-')}\n"
+        f"{'-' * 58}\n"
+    )
+
+
+def _verif_ban_line(device_id: str, ban_string: Optional[str]) -> str:
+    """Format baris untuk device banned (mengikuti format_ban_string)."""
+    if ban_string:
+        return ban_string
+    return (
+        f"{device_id} |  Reason Name: Using Plug-in Apps to Compromise Competitive Fairness"
+        f" |  Duration: Day -, 00:00:00"
+    )
+
+
+def verif_3x_bulk():
+    banner()
+    section("◈  4 VERIFIKASI LANGKAH — 3X SCAN")
+    print()
+    print(f"  {Fore.LIGHTBLACK_EX}Fitur ini menjalankan pemeriksaan berlapis:{Style.RESET_ALL}")
+    print(f"    {Fore.CYAN}•{Style.RESET_ALL} Scan 1 → 🔍 Cek Valid + 🚫 Cek Banned")
+    print(f"    {Fore.CYAN}•{Style.RESET_ALL} Scan 2 → 🔄 Ulangi Cek Valid + Cek Banned")
+    print(f"    {Fore.CYAN}•{Style.RESET_ALL} Scan 3 → ✅ Verifikasi akhir (Valid + Banned)")
+    print(f"    {Fore.CYAN}•{Style.RESET_ALL} Bandingkan hasil 3 scan → hanya status konsisten yang di-verifikasi")
+    print()
+    print(f"  {Fore.LIGHTBLACK_EX}Output: 2 file terpisah (Tidak Terbanned & Sudah Terbanned){Style.RESET_ALL}")
+    print(f"  {Fore.LIGHTBLACK_EX}Format input: {Style.RESET_ALL}{Fore.WHITE}.txt / .json{Style.RESET_ALL}"
+          f" {Fore.LIGHTBLACK_EX}(max 20 MB){Style.RESET_ALL}")
+    print()
+
+    filepath = input(
+        f"  {Fore.CYAN}FILE TXT / JSON{Style.RESET_ALL}\n"
+        f"  {Fore.YELLOW}➤ {Style.RESET_ALL}"
+    ).strip().strip('"').strip("'")
+
+    if not filepath:
+        print(f"\n  {Fore.RED}✖ Tidak ada file yang dipilih.{Style.RESET_ALL}")
+        pause()
+        return
+
+    if not os.path.exists(filepath):
+        print(f"\n  {Fore.RED}✖ File tidak ditemukan: {filepath}{Style.RESET_ALL}")
+        pause()
+        return
+
+    # Cek ekstensi
+    lower = filepath.lower()
+    if not (lower.endswith(".txt") or lower.endswith(".json")):
+        print(f"\n  {Fore.RED}✖ File harus berekstensi .txt atau .json{Style.RESET_ALL}")
+        pause()
+        return
+
+    # Cek ukuran file (max 20 MB)
+    try:
+        fsize = os.path.getsize(filepath)
+    except Exception as e:
+        print(f"\n  {Fore.RED}✖ Gagal membaca ukuran file: {e}{Style.RESET_ALL}")
+        pause()
+        return
+
+    if fsize > MAX_FILE_SIZE:
+        print(
+            f"\n  {Fore.RED}✖ Ukuran file terlalu besar: "
+            f"{fsize / 1024 / 1024:.2f} MB (max 20.00 MB){Style.RESET_ALL}"
+        )
+        pause()
+        return
+
+    # Baca device ID
+    try:
+        devices = load_devices_from_file_verif(filepath)
+    except ValueError as e:
+        print(f"\n  {Fore.RED}✖ {e}{Style.RESET_ALL}")
+        pause()
+        return
+    except Exception as e:
+        print(f"\n  {Fore.RED}✖ Gagal membaca file: {e}{Style.RESET_ALL}")
+        pause()
+        return
+
+    if not devices:
+        print(f"\n  {Fore.RED}✖ Tidak ada Device ID valid (and_/ios_) di dalam file.{Style.RESET_ALL}")
+        pause()
+        return
+
+    # Threads config
+    try:
+        t_input = input(
+            f"\n  {Fore.CYAN}Jumlah threads [{VERIF_THREADS}]: {Style.RESET_ALL}"
+        ).strip()
+        threads = int(t_input) if t_input else VERIF_THREADS
+    except ValueError:
+        threads = VERIF_THREADS
+    threads = max(1, min(30, threads))
+
+    total = len(devices)
+    print()
+    print(f"  {Fore.GREEN}✓ File berhasil dibaca{Style.RESET_ALL}")
+    print(f"  {Fore.LIGHTBLACK_EX}│{Style.RESET_ALL} 📄 File      : {Fore.WHITE}{os.path.basename(filepath)}{Style.RESET_ALL}")
+    print(f"  {Fore.LIGHTBLACK_EX}│{Style.RESET_ALL} 📱 Total ID  : {Fore.CYAN}{total}{Style.RESET_ALL}")
+    print(f"  {Fore.LIGHTBLACK_EX}│{Style.RESET_ALL} 🧵 Threads   : {Fore.CYAN}{threads}{Style.RESET_ALL}")
+    print(f"  {Fore.LIGHTBLACK_EX}│{Style.RESET_ALL} 📦 Max size  : {Fore.CYAN}20 MB{Style.RESET_ALL}")
+    print()
+
+    # ═════════════════════════════════════════════════════════════════
+    # EKSEKUSI 3X SCAN
+    # ═════════════════════════════════════════════════════════════════
+    scan_results: List[Dict[str, dict]] = []
+    for i in (1, 2, 3):
+        header = {
+            1: "SCAN 1/3 — 🔍 Pemeriksaan Pertama",
+            2: "SCAN 2/3 — 🔄 Pengulangan Kedua",
+            3: "SCAN 3/3 — ✅ Pemeriksaan Terakhir",
+        }[i]
+        print()
+        print(f"  {Fore.MAGENTA}{Style.BRIGHT}╔══════════════════════════════════════════════════════════════╗{Style.RESET_ALL}")
+        print(f"  {Fore.MAGENTA}{Style.BRIGHT}║{Style.RESET_ALL} {Fore.WHITE}{Style.BRIGHT}{header:<60}{Style.RESET_ALL} {Fore.MAGENTA}{Style.BRIGHT}║{Style.RESET_ALL}")
+        print(f"  {Fore.MAGENTA}{Style.BRIGHT}╚══════════════════════════════════════════════════════════════╝{Style.RESET_ALL}")
+
+        res = _verif_single_scan(devices, i, threads)
+        scan_results.append(res)
+
+        cnt_valid = sum(1 for d in devices if res[d]["valid"])
+        cnt_ban = sum(1 for d in devices if res[d]["ban_status"] == "BANNED")
+        cnt_clean = sum(1 for d in devices if res[d]["ban_status"] == "CLEAN")
+        cnt_unknown = sum(1 for d in devices if res[d]["ban_status"] == "UNKNOWN")
+        print(f"  {Fore.GREEN}✓ SCAN {i}/3 selesai{Style.RESET_ALL}")
+        print(f"    {Fore.LIGHTBLACK_EX}•{Style.RESET_ALL} 🔍 Valid   : {Fore.CYAN}{cnt_valid}{Style.RESET_ALL}")
+        print(f"    {Fore.LIGHTBLACK_EX}•{Style.RESET_ALL} 🚫 Banned  : {Fore.RED}{cnt_ban}{Style.RESET_ALL}")
+        print(f"    {Fore.LIGHTBLACK_EX}•{Style.RESET_ALL} ✅ Clean   : {Fore.GREEN}{cnt_clean}{Style.RESET_ALL}")
+        print(f"    {Fore.LIGHTBLACK_EX}•{Style.RESET_ALL} ⚠️  Unknown : {Fore.YELLOW}{cnt_unknown}{Style.RESET_ALL}")
+
+    # ═════════════════════════════════════════════════════════════════
+    # BANDINGKAN HASIL 3 SCAN
+    # ═════════════════════════════════════════════════════════════════
+    print()
+    print(f"  {Fore.CYAN}📊 Membandingkan hasil 3 scan...{Style.RESET_ALL}")
+
+    file_clean: List[Tuple[str, dict]] = []
+    file_banned: List[Tuple[str, str]] = []
+    inconsistent: List[Tuple[str, str]] = []
+    invalid_final: List[str] = []
+
+    for d in devices:
+        s1 = scan_results[0].get(d) or {}
+        s2 = scan_results[1].get(d) or {}
+        s3 = scan_results[2].get(d) or {}
+
+        v1 = bool(s1.get("valid"))
+        v2 = bool(s2.get("valid"))
+        v3 = bool(s3.get("valid"))
+        b1 = s1.get("ban_status")
+        b2 = s2.get("ban_status")
+        b3 = s3.get("ban_status")
+
+        # Wajib valid di ketiga scan
+        if not (v1 and v2 and v3):
+            invalid_final.append(d)
+            continue
+
+        # Semua CLEAN = verified clean
+        if b1 == "CLEAN" and b2 == "CLEAN" and b3 == "CLEAN":
+            data = s3.get("data") or s2.get("data") or s1.get("data") or {}
+            file_clean.append((d, data))
+        # Semua BANNED = verified banned
+        elif b1 == "BANNED" and b2 == "BANNED" and b3 == "BANNED":
+            ban_str = (
+                s3.get("ban_string")
+                or s2.get("ban_string")
+                or s1.get("ban_string")
+            )
+            file_banned.append((d, _verif_ban_line(d, ban_str)))
+        else:
+            reason = f"scan1={b1}, scan2={b2}, scan3={b3}"
+            inconsistent.append((d, reason))
+
+    # ═════════════════════════════════════════════════════════════════
+    # SUSUN FILE HASIL (2 FILE TERPISAH)
+    # ═════════════════════════════════════════════════════════════════
+    now = datetime.datetime.now()
+    tanggal = now.strftime("%Y-%m-%d")
+    waktu = now.strftime("%H-%M-%S")
+    ts_full = now.strftime("%Y-%m-%d %H:%M:%S")
+
+    out_dir = Path(os.path.dirname(os.path.abspath(__file__))) / "verif_results"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    fname1 = f"Device ID Tidak Terbanned {tanggal} {waktu}.txt"
+    fname2 = f"Device ID Sudah Terbanned {tanggal} {waktu}.txt"
+    path1 = out_dir / fname1
+    path2 = out_dir / fname2
+
+    # ── FILE 1 — TIDAK TERBANNED ─────────────────────────────────
+    with path1.open("w", encoding="utf-8") as f:
+        f.write("═" * 60 + "\n")
+        f.write("WEIRDMARKET — DEVICE ID TIDAK TERBANNED\n")
+        f.write("(Hasil Verifikasi 3X SCAN — Valid + Banned)\n")
+        f.write("═" * 60 + "\n")
+        f.write(f"Timestamp       : {ts_full}\n")
+        f.write(f"Total Input     : {total}\n")
+        f.write(f"Verified Clean  : {len(file_clean)}\n")
+        f.write(f"Verified Banned : {len(file_banned)}\n")
+        f.write(f"Inconsistent    : {len(inconsistent)}\n")
+        f.write(f"Invalid Device  : {len(invalid_final)}\n")
+        f.write("═" * 60 + "\n\n")
+        f.write("┌──────────────────────────────────────────────┐\n")
+        f.write("│  ✅ DEVICE ID TIDAK TERBANNED (VERIFIED 3X) │\n")
+        f.write("└──────────────────────────────────────────────┘\n")
+        for d_id, data in file_clean:
+            f.write(_verif_format_clean_record(d_id, data))
+        if not file_clean:
+            f.write("(Tidak ada device yang terverifikasi clean)\n")
+
+        if inconsistent:
+            f.write("\n")
+            f.write("┌──────────────────────────────────────────────┐\n")
+            f.write("│  ⚠️  INCONSISTENT (TIDAK DIVERIFIKASI)       │\n")
+            f.write("└──────────────────────────────────────────────┘\n")
+            for d_id, reason in inconsistent:
+                f.write(f"{d_id} |  INCONSISTENT  |  {reason}\n")
+
+        if invalid_final:
+            f.write("\n")
+            f.write("┌──────────────────────────────────────────────┐\n")
+            f.write("│  ❌ INVALID DEVICE ID (GAGAL VALID)          │\n")
+            f.write("└──────────────────────────────────────────────┘\n")
+            for d_id in invalid_final:
+                f.write(f"{d_id}\n")
+
+    # ── FILE 2 — SUDAH TERBANNED ─────────────────────────────────
+    with path2.open("w", encoding="utf-8") as f:
+        f.write("═" * 60 + "\n")
+        f.write("WEIRDMARKET — DEVICE ID SUDAH TERBANNED\n")
+        f.write("(Hasil Verifikasi 3X SCAN — Valid + Banned)\n")
+        f.write("═" * 60 + "\n")
+        f.write(f"Timestamp       : {ts_full}\n")
+        f.write(f"Total Input     : {total}\n")
+        f.write(f"Verified Banned : {len(file_banned)}\n")
+        f.write("═" * 60 + "\n\n")
+        f.write("┌──────────────────────────────────────────────┐\n")
+        f.write("│  🚫 DEVICE ID SUDAH TERBANNED (VERIFIED 3X) │\n")
+        f.write("└──────────────────────────────────────────────┘\n")
+        for _d_id, line in file_banned:
+            f.write(line + "\n")
+        if not file_banned:
+            f.write("(Tidak ada device yang terverifikasi banned)\n")
+
+    # ═════════════════════════════════════════════════════════════════
+    # TAMPILKAN HASIL
+    # ═════════════════════════════════════════════════════════════════
+    print()
+    print(f"  {Fore.MAGENTA}{Style.BRIGHT}╔══════════════════════════════════════════════════════════════╗{Style.RESET_ALL}")
+    print(f"  {Fore.MAGENTA}{Style.BRIGHT}║{Style.RESET_ALL} {Fore.WHITE}{Style.BRIGHT}{'🏁  4 VERIFIKASI LANGKAH — SELESAI':<60}{Style.RESET_ALL} {Fore.MAGENTA}{Style.BRIGHT}║{Style.RESET_ALL}")
+    print(f"  {Fore.MAGENTA}{Style.BRIGHT}╚══════════════════════════════════════════════════════════════╝{Style.RESET_ALL}")
+    print()
+    print(f"  {Fore.LIGHTBLACK_EX}┌─ Ringkasan ────────────────────────────────────────────┐{Style.RESET_ALL}")
+    print(f"  {Fore.LIGHTBLACK_EX}│{Style.RESET_ALL} 📱 Total Input        : {Fore.CYAN}{total}{Style.RESET_ALL}")
+    print(f"  {Fore.LIGHTBLACK_EX}│{Style.RESET_ALL} ✅ Verified Clean     : {Fore.GREEN}{len(file_clean)}{Style.RESET_ALL}")
+    print(f"  {Fore.LIGHTBLACK_EX}│{Style.RESET_ALL} 🚫 Verified Banned    : {Fore.RED}{len(file_banned)}{Style.RESET_ALL}")
+    print(f"  {Fore.LIGHTBLACK_EX}│{Style.RESET_ALL} ⚠️  Inconsistent      : {Fore.YELLOW}{len(inconsistent)}{Style.RESET_ALL}")
+    print(f"  {Fore.LIGHTBLACK_EX}│{Style.RESET_ALL} ❌ Invalid Device     : {Fore.MAGENTA}{len(invalid_final)}{Style.RESET_ALL}")
+    print(f"  {Fore.LIGHTBLACK_EX}└────────────────────────────────────────────────────────┘{Style.RESET_ALL}")
+    print()
+    print(f"  {Fore.LIGHTBLACK_EX}📁 File hasil:{Style.RESET_ALL}")
+    print(f"    {Fore.GREEN}✓{Style.RESET_ALL} {path1}")
+    print(f"    {Fore.GREEN}✓{Style.RESET_ALL} {path2}")
+
+    footer()
+    pause()
+
+
+def verif_menu():
+    while True:
+        banner()
+        section("◈  4 VERIFIKASI LANGKAH — 3X SCAN")
+        print()
+        print(f"  {Fore.LIGHTBLACK_EX}Alur verifikasi 3x scan berurutan:{Style.RESET_ALL}")
+        print(f"    {Fore.CYAN}🔍 Scan 1{Style.RESET_ALL} → Cek Valid  →  {Fore.RED}🚫{Style.RESET_ALL} Cek Banned")
+        print(f"    {Fore.CYAN}🔄 Scan 2{Style.RESET_ALL} → Cek Valid  →  {Fore.RED}🚫{Style.RESET_ALL} Cek Banned")
+        print(f"    {Fore.CYAN}✅ Scan 3{Style.RESET_ALL} → Cek Valid  →  {Fore.RED}🚫{Style.RESET_ALL} Cek Banned")
+        print()
+        print(f"  {Fore.LIGHTBLACK_EX}Hasil per device dibandingkan antar 3 scan.{Style.RESET_ALL}")
+        print(f"  {Fore.LIGHTBLACK_EX}Hanya status yang KONSISTEN yang divalidasi ke file.{Style.RESET_ALL}")
+        print()
+        print(f"  {Fore.CYAN}[1]{Style.RESET_ALL}  📦 BULK 3X SCAN  {Fore.LIGHTBLACK_EX}(TXT / JSON, max 20 MB){Style.RESET_ALL}")
+        print(f"  {Fore.LIGHTBLACK_EX}[0]{Style.RESET_ALL}  BACK")
+        choice = input(f"\n{Fore.CYAN}Pilih menu [0-1]: {Style.RESET_ALL}").strip()
+
+        if choice == "1":
+            verif_3x_bulk()
+        elif choice == "0":
+            return
+        else:
+            print(f"{Fore.RED}Pilihan tidak valid.{Style.RESET_ALL}")
+            pause()
+
+
 # ══════════════════════════════════════════════════════════════════════
-# TELEGRAM BOT
+# MENU SUB-FITUR
 # ══════════════════════════════════════════════════════════════════════
-USER_STATE = {}
+def valid_menu():
+    while True:
+        banner()
+        section("CEK VALID")
+        print(
+            f"\n  {Fore.CYAN}[1]{Style.RESET_ALL}  SINGLE CHECK"
+            f"\n  {Fore.CYAN}[2]{Style.RESET_ALL}  BULK CHECK"
+            f"\n  {Fore.LIGHTBLACK_EX}[0]{Style.RESET_ALL}  BACK"
+        )
+        choice = input(f"\n{Fore.CYAN}Pilih menu [0-2]: {Style.RESET_ALL}").strip()
+
+        if choice == "1":
+            valid_single()
+        elif choice == "2":
+            valid_bulk()
+        elif choice == "0":
+            return
+        else:
+            print(f"{Fore.RED}Pilihan tidak valid.{Style.RESET_ALL}")
+            pause()
 
 
-def get_state(uid):
-    if uid not in USER_STATE:
-        USER_STATE[uid] = {"bulk_running": False, "bulk_stop": False}
-    return USER_STATE[uid]
+def ban_menu():
+    while True:
+        banner()
+        section("CEK BAN")
+        print(
+            f"\n  {Fore.CYAN}[1]{Style.RESET_ALL}  SINGLE CHECK"
+            f"\n  {Fore.CYAN}[2]{Style.RESET_ALL}  BULK CHECK"
+            f"\n  {Fore.LIGHTBLACK_EX}[0]{Style.RESET_ALL}  BACK"
+        )
+        choice = input(f"\n{Fore.CYAN}Pilih menu [0-2]: {Style.RESET_ALL}").strip()
+
+        if choice == "1":
+            ban_single()
+        elif choice == "2":
+            run_bulk_mode()
+            pause()
+        elif choice == "0":
+            return
+        else:
+            print(f"{Fore.RED}Pilihan tidak valid.{Style.RESET_ALL}")
+            pause()
 
 
-def is_owner(uid):
+# ══════════════════════════════════════════════════════════════════════
+# MAIN MENU
+# ══════════════════════════════════════════════════════════════════════
+def main_menu():
+    while True:
+        banner()
+        section("MAIN MENU")
+        print(
+            f"\n  {Fore.YELLOW}{Style.BRIGHT}[1]{Style.RESET_ALL}  {TITLE}CEK VALID{Style.RESET_ALL}"
+            f"   {MUTED}Single & Bulk Device ID validation{Style.RESET_ALL}\n"
+            f"  {Fore.YELLOW}{Style.BRIGHT}[2]{Style.RESET_ALL}  {TITLE}CEK BAN{Style.RESET_ALL}"
+            f"     {MUTED}Single & Bulk ban status checking{Style.RESET_ALL}\n"
+            f"  {Fore.YELLOW}{Style.BRIGHT}[3]{Style.RESET_ALL}  {TITLE}SPLIT / DEVICE MANAGER{Style.RESET_ALL}"
+            f" {MUTED}Full info, Device ID, Android & iOS{Style.RESET_ALL}\n"
+            f"  {Fore.MAGENTA}{Style.BRIGHT}[4]{Style.RESET_ALL}  {TITLE}4 VERIFIKASI LANGKAH — 3X SCAN{Style.RESET_ALL}"
+            f" {MUTED}Valid + Banned · 3 pass verifikasi{Style.RESET_ALL}\n"
+            f"  {Fore.RED}{Style.BRIGHT}[0]{Style.RESET_ALL}  {TITLE}KELUAR{Style.RESET_ALL}"
+        )
+        footer()
+        choice = input(
+            f"\n{Fore.CYAN}{Style.BRIGHT}WEIRD TOOLS {Style.RESET_ALL}"
+            f"{MUTED}› {Style.RESET_ALL}Pilih menu [0-4]: "
+        ).strip()
+
+        if choice == "1":
+            valid_menu()
+        elif choice == "2":
+            ban_menu()
+        elif choice == "3":
+            split_manager_menu()
+        elif choice == "4":
+            verif_menu()
+        elif choice == "0":
+            clear_screen()
+            print()
+            print(f"{Fore.MAGENTA}╭{'═' * (UI_WIDTH - 2)}╮{Style.RESET_ALL}")
+            center("WEIRD TOOLS", Fore.CYAN, True)
+            center("Program selesai. Terima kasih.", Fore.LIGHTBLACK_EX)
+            print(f"{Fore.MAGENTA}╰{'═' * (UI_WIDTH - 2)}╯{Style.RESET_ALL}")
+            break
+        else:
+            print(f"{Fore.RED}Pilihan tidak valid. Gunakan 0, 1, 2, 3, atau 4.{Style.RESET_ALL}")
+            pause()
+
+
+# ══════════════════════════════════════════════════════════════════════
+# TELEGRAM BOT INTEGRATION
+# ══════════════════════════════════════════════════════════════════════
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
+from telegram.ext import (
+    Application, CommandHandler, CallbackQueryHandler,
+    MessageHandler, filters, ContextTypes
+)
+
+BOT_TOKEN = "8867228317:AAFBS1ke3wGF8BHOuvE9D3nJysdTAjn-SMA"
+OWNER_ID = 7601958159
+
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger(__name__)
+for _l in ("httpx", "telegram", "telegram.ext"):
+    logging.getLogger(_l).setLevel(logging.WARNING)
+
+BOT_USER_STATE: Dict[int, dict] = {}
+
+
+def bot_get_state(uid: int) -> dict:
+    if uid not in BOT_USER_STATE:
+        BOT_USER_STATE[uid] = {
+            "awaiting": None,
+            "split_mode": None,
+            "split_size": 50,
+        }
+    return BOT_USER_STATE[uid]
+
+
+def bot_is_owner(uid: int) -> bool:
     return uid == OWNER_ID
 
 
-def main_menu_kb():
+def bot_main_menu_kb():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ CEK VALID", callback_data="menu_valid"),
          InlineKeyboardButton("🚫 CEK BAN", callback_data="menu_ban")],
-        [InlineKeyboardButton("🔥 FULL CHECK (VALID+BAN)", callback_data="menu_fullcheck")],
         [InlineKeyboardButton("⚡ 4 VERIFIKASI LANGKAH — 3X SCAN", callback_data="menu_verif")],
         [InlineKeyboardButton("✂️ SPLIT / DEVICE MANAGER", callback_data="menu_split")],
     ])
 
 
-def valid_menu_kb():
+def bot_valid_menu_kb():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🔍 SINGLE", callback_data="valid_single"),
          InlineKeyboardButton("📦 BULK", callback_data="valid_bulk")],
@@ -912,7 +2194,7 @@ def valid_menu_kb():
     ])
 
 
-def ban_menu_kb():
+def bot_ban_menu_kb():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🔍 SINGLE", callback_data="ban_single"),
          InlineKeyboardButton("📦 BULK", callback_data="ban_bulk")],
@@ -920,21 +2202,14 @@ def ban_menu_kb():
     ])
 
 
-def fullcheck_menu_kb():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📦 BULK FULL CHECK", callback_data="fullcheck_bulk")],
-        [InlineKeyboardButton("⬅️ Kembali", callback_data="menu_main")],
-    ])
-
-
-def verif_menu_kb():
+def bot_verif_menu_kb():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📦 BULK 3X SCAN (TXT / JSON)", callback_data="verif_bulk")],
         [InlineKeyboardButton("⬅️ Kembali", callback_data="menu_main")],
     ])
 
 
-def split_menu_kb():
+def bot_split_menu_kb():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📄 SPLIT FULL INFO", callback_data="split_full")],
         [InlineKeyboardButton("🆔 SPLIT DEVICE ID", callback_data="split_devid")],
@@ -944,25 +2219,25 @@ def split_menu_kb():
     ])
 
 
-def back_kb():
+def bot_back_kb():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("⬅️ Kembali", callback_data="menu_main")]
     ])
 
 
-def cancel_kb():
+def bot_cancel_kb():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("❌ Batal", callback_data="menu_main")]
     ])
 
 
-def txt(update):
+def bot_chat_id(update: Update):
     if update.callback_query:
         return update.callback_query.message.chat_id
     return update.message.chat_id
 
 
-async def edit_or_send(update, context, text, kb=None, parse_mode="Markdown"):
+async def bot_edit_or_send(update, context, text, kb=None, parse_mode="Markdown"):
     if update.callback_query:
         try:
             await update.callback_query.message.edit_text(
@@ -971,7 +2246,7 @@ async def edit_or_send(update, context, text, kb=None, parse_mode="Markdown"):
         except Exception:
             try:
                 return await context.bot.send_message(
-                    chat_id=txt(update), text=text,
+                    chat_id=bot_chat_id(update), text=text,
                     parse_mode=parse_mode, reply_markup=kb)
             except Exception:
                 return None
@@ -983,126 +2258,124 @@ async def edit_or_send(update, context, text, kb=None, parse_mode="Markdown"):
             return None
 
 
-# ──────────────────────────────────────────────────────────────────────
-# COMMANDS
-# ──────────────────────────────────────────────────────────────────────
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ── Bot: wrappers sync ──────────────────────────────────────────────
+def _bot_run_valid_single(device_id: str):
+    try:
+        return GameLogin(device_id).run()
+    except Exception:
+        return None
+
+
+def _bot_run_ban_single(device_id: str):
+    try:
+        return check_device_ban_silent(device_id)
+    except Exception:
+        return "UNKNOWN", device_id
+
+
+# ── Bot: Command handlers ───────────────────────────────────────────
+async def bot_cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
-    if not is_owner(u.id):
+    if not bot_is_owner(u.id):
         await update.message.reply_text("❌ Bot private.")
         return
     text = (
         "🌟 *WEIRDMARKET TELEGRAM BOT* 🌟\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
         f"Halo *{u.first_name}*! 👋\n\n"
-        "Pilih menu di bawah. ✨\n\n"
-        "  ✅ CEK VALID — Single & Bulk\n"
-        "  🚫 CEK BAN — Single & Bulk\n"
-        "  🔥 FULL CHECK — Valid + Ban\n"
-        "  ⚡ 4 VERIFIKASI LANGKAH — 3X SCAN\n"
-        "  ✂️ SPLIT / DEVICE MANAGER\n\n"
+        "Pilih menu di bawah ini:\n\n"
+        "  ✅ *CEK VALID* — Single & Bulk\n"
+        "  🚫 *CEK BAN* — Single & Bulk\n"
+        "  ⚡ *4 VERIFIKASI LANGKAH* — 3X SCAN\n"
+        "  ✂️ *SPLIT / DEVICE MANAGER*\n\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "_WEIRDMARKET • OFFICIAL TOOLS_"
     )
-    await update.message.reply_text(text, parse_mode="Markdown",
-                                    reply_markup=main_menu_kb())
+    await update.message.reply_text(
+        text, parse_mode="Markdown", reply_markup=bot_main_menu_kb())
 
 
-async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    get_state(update.effective_user.id)["awaiting"] = None
-    await update.message.reply_text("❌ Dibatalkan.", reply_markup=back_kb())
-    return ConversationHandler.END
+async def bot_cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    st = bot_get_state(update.effective_user.id)
+    st["awaiting"] = None
+    st["split_mode"] = None
+    await update.message.reply_text(
+        "❌ Dibatalkan.", reply_markup=bot_back_kb())
 
 
-async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ── Bot: Button router ──────────────────────────────────────────────
+async def bot_button_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    if not is_owner(q.from_user.id):
+    if not bot_is_owner(q.from_user.id):
         return
     data = q.data
 
     if data == "menu_main":
-        await show_main_menu(update, context)
+        await bot_show_main(update, context)
     elif data == "menu_valid":
-        await show_valid_menu(update, context)
+        await bot_show_valid(update, context)
     elif data == "menu_ban":
-        await show_ban_menu(update, context)
-    elif data == "menu_fullcheck":
-        await show_fullcheck_menu(update, context)
+        await bot_show_ban(update, context)
     elif data == "menu_verif":
-        await show_verif_menu(update, context)
+        await bot_show_verif(update, context)
     elif data == "menu_split":
-        await show_split_menu(update, context)
+        await bot_show_split(update, context)
     elif data == "valid_single":
-        await show_valid_single(update, context)
+        await bot_show_valid_single(update, context)
     elif data == "valid_bulk":
-        await show_valid_bulk(update, context)
+        await bot_show_valid_bulk(update, context)
     elif data == "ban_single":
-        await show_ban_single(update, context)
+        await bot_show_ban_single(update, context)
     elif data == "ban_bulk":
-        await show_ban_bulk(update, context)
-    elif data == "fullcheck_bulk":
-        await show_fullcheck_bulk(update, context)
+        await bot_show_ban_bulk(update, context)
     elif data == "verif_bulk":
-        await show_verif_bulk(update, context)
-    elif data == "split_full":
-        await show_split_input(update, context, "split_full")
-    elif data == "split_devid":
-        await show_split_input(update, context, "split_devid")
-    elif data == "split_plat":
-        await show_split_input(update, context, "split_plat")
-    elif data == "split_dedup":
-        await show_split_input(update, context, "split_dedup")
+        await bot_show_verif_bulk(update, context)
+    elif data in ("split_full", "split_devid", "split_plat", "split_dedup"):
+        await bot_show_split_input(update, context, data)
 
 
-async def show_main_menu(update, context):
+# ── Bot: menu displays ──────────────────────────────────────────────
+async def bot_show_main(update, context):
     text = (
         "🌟 *WEIRDMARKET TELEGRAM BOT* 🌟\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
         "Pilih menu:\n\n"
         "  ✅ *CEK VALID* — Single & Bulk\n"
         "  🚫 *CEK BAN* — Single & Bulk\n"
-        "  🔥 *FULL CHECK* — Valid + Ban sekaligus\n"
         "  ⚡ *4 VERIFIKASI LANGKAH* — 3X SCAN\n"
         "  ✂️ *SPLIT* / DEVICE MANAGER\n"
     )
-    await edit_or_send(update, context, text, kb=main_menu_kb())
+    await bot_edit_or_send(update, context, text, kb=bot_main_menu_kb())
 
 
-async def show_valid_menu(update, context):
-    await edit_or_send(update, context,
-        "✅ *CEK VALID*\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        "Logic: login server → game server → role info\n\nPilih mode:",
-        kb=valid_menu_kb())
-
-
-async def show_ban_menu(update, context):
-    await edit_or_send(update, context,
-        "🚫 *CEK BAN*\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        "Cek status ban akun MLBB.\n\nPilih mode:",
-        kb=ban_menu_kb())
-
-
-async def show_fullcheck_menu(update, context):
-    await edit_or_send(update, context,
-        "🔥 *FULL CHECK — VALID + BAN*\n"
+async def bot_show_valid(update, context):
+    await bot_edit_or_send(
+        update, context,
+        "✅ *CEK VALID*\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        "Bot akan:\n"
-        "  1️⃣ Scan valid device ID (login → game → role)\n"
-        "  2️⃣ Cek status ban akun yang valid\n"
-        "  3️⃣ Hasil dikirim dalam file .txt\n\n"
-        "📄 Support file *.txt* / *.json*\n"
-        "📦 Max 20 MB\n\n"
-        "⚡ Proses otomatis setelah file dikirim.",
-        kb=fullcheck_menu_kb())
+        "Logic: login server → game server → role info\n\n"
+        "Pilih mode:",
+        kb=bot_valid_menu_kb())
 
 
-async def show_verif_menu(update, context):
-    await edit_or_send(update, context,
+async def bot_show_ban(update, context):
+    await bot_edit_or_send(
+        update, context,
+        "🚫 *CEK BAN*\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "Cek status ban akun MLBB.\n\n"
+        "Pilih mode:",
+        kb=bot_ban_menu_kb())
+
+
+async def bot_show_verif(update, context):
+    await bot_edit_or_send(
+        update, context,
         "⚡ *4 VERIFIKASI LANGKAH — 3X SCAN*\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        "Fitur ini menjalankan pemeriksaan berlapis untuk memastikan\n"
-        "device ID benar-benar *valid* dan *tidak terbanned*.\n\n"
+        "Fitur ini menjalankan pemeriksaan berlapis untuk\n"
+        "memastikan device ID benar-benar *valid* dan *tidak terbanned*.\n\n"
         "🔄 *Alur Verifikasi:*\n"
         "  🔍 Scan 1 → Cek Valid ✅ + Cek Banned 🚫\n"
         "  🔄 Scan 2 → Ulangi Cek Valid ✅ + Cek Banned 🚫\n"
@@ -1117,70 +2390,72 @@ async def show_verif_menu(update, context):
         "📄 Support file *.txt* / *.json*\n"
         "📦 Max 20 MB\n\n"
         "⚡ Proses otomatis setelah file dikirim.",
-        kb=verif_menu_kb())
+        kb=bot_verif_menu_kb())
 
 
-async def show_split_menu(update, context):
-    await edit_or_send(update, context,
-        "✂️ *SPLIT / DEVICE MANAGER*\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        "Upload file *.txt* berisi Device ID.\n\nPilih tipe split:",
-        kb=split_menu_kb())
-
-
-async def show_valid_single(update, context):
-    s = get_state(update.effective_user.id)
-    s["awaiting"] = "valid_single"
-    await edit_or_send(update, context,
-        "✅ *CEK VALID — SINGLE*\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        "Kirim *satu Device ID* untuk dicek.",
-        kb=cancel_kb())
-
-
-async def show_valid_bulk(update, context):
-    s = get_state(update.effective_user.id)
-    s["awaiting"] = "valid_bulk_file"
-    await edit_or_send(update, context,
-        "✅ *CEK VALID — BULK*\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        "Kirim file *.txt* / *.json* berisi Device ID.\n"
-        "⚡ Bot langsung eksekusi otomatis.",
-        kb=cancel_kb())
-
-
-async def show_ban_single(update, context):
-    s = get_state(update.effective_user.id)
-    s["awaiting"] = "ban_single"
-    await edit_or_send(update, context,
-        "🚫 *CEK BAN — SINGLE*\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        "Kirim *satu Device ID* untuk dicek.",
-        kb=cancel_kb())
-
-
-async def show_ban_bulk(update, context):
-    s = get_state(update.effective_user.id)
-    s["awaiting"] = "ban_bulk_file"
-    await edit_or_send(update, context,
-        "🚫 *CEK BAN — BULK*\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        "Kirim file *.txt* / *.json* berisi Device ID.\n"
-        "⚡ Bot langsung eksekusi otomatis.",
-        kb=cancel_kb())
-
-
-async def show_fullcheck_bulk(update, context):
-    s = get_state(update.effective_user.id)
-    s["awaiting"] = "fullcheck_file"
-    await edit_or_send(update, context,
-        "🔥 *FULL CHECK — BULK*\n"
+async def bot_show_split(update, context):
+    await bot_edit_or_send(
+        update, context,
+        "✂️ *SPLIT / DEVICE MANAGER*\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        "Kirim file *.txt* / *.json* berisi Device ID.\n"
-        "📦 Max 20 MB\n\n"
+        "Upload file *.txt* berisi Device ID.\n\n"
+        "Pilih tipe split:",
+        kb=bot_split_menu_kb())
+
+
+async def bot_show_valid_single(update, context):
+    st = bot_get_state(update.effective_user.id)
+    st["awaiting"] = "valid_single"
+    await bot_edit_or_send(
+        update, context,
+        "✅ *CEK VALID — SINGLE*\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "Kirim *satu Device ID* untuk dicek.",
+        kb=bot_cancel_kb())
+
+
+async def bot_show_valid_bulk(update, context):
+    st = bot_get_state(update.effective_user.id)
+    st["awaiting"] = "valid_bulk"
+    await bot_edit_or_send(
+        update, context,
+        "✅ *CEK VALID — BULK*\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "Kirim file *.txt* / *.json* berisi Device ID.\n\n"
+        "📦 Max 20 MB\n"
         "⚡ Bot langsung eksekusi otomatis.",
-        kb=cancel_kb())
+        kb=bot_cancel_kb())
 
 
-async def show_verif_bulk(update, context):
-    s = get_state(update.effective_user.id)
-    s["awaiting"] = "verif_bulk_file"
-    await edit_or_send(update, context,
+async def bot_show_ban_single(update, context):
+    st = bot_get_state(update.effective_user.id)
+    st["awaiting"] = "ban_single"
+    await bot_edit_or_send(
+        update, context,
+        "🚫 *CEK BAN — SINGLE*\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "Kirim *satu Device ID* untuk dicek.",
+        kb=bot_cancel_kb())
+
+
+async def bot_show_ban_bulk(update, context):
+    st = bot_get_state(update.effective_user.id)
+    st["awaiting"] = "ban_bulk"
+    await bot_edit_or_send(
+        update, context,
+        "🚫 *CEK BAN — BULK*\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "Kirim file *.txt* / *.json* berisi Device ID.\n\n"
+        "📦 Max 20 MB\n"
+        "⚡ Bot langsung eksekusi otomatis.",
+        kb=bot_cancel_kb())
+
+
+async def bot_show_verif_bulk(update, context):
+    st = bot_get_state(update.effective_user.id)
+    st["awaiting"] = "verif_bulk"
+    await bot_edit_or_send(
+        update, context,
         "⚡ *4 VERIFIKASI — BULK 3X SCAN*\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
         "📂 Kirim file *.txt* atau *.json* berisi Device ID.\n"
@@ -1188,54 +2463,58 @@ async def show_verif_bulk(update, context):
         "Bot akan otomatis menjalankan 3 scan berturut-turut:\n"
         "  🔍 Valid → 🚫 Banned → 🔄 ulangi → ✅ verifikasi akhir\n\n"
         "⚡ Langsung eksekusi setelah file dikirim.",
-        kb=cancel_kb())
+        kb=bot_cancel_kb())
 
 
-async def show_split_input(update, context, mode):
-    s = get_state(update.effective_user.id)
-    s["awaiting"] = "split_file"
-    s["split_mode"] = mode
+async def bot_show_split_input(update, context, mode):
+    st = bot_get_state(update.effective_user.id)
+    st["awaiting"] = "split"
+    st["split_mode"] = mode
     mode_label = {
         "split_full": "📄 SPLIT FULL INFO",
         "split_devid": "🆔 SPLIT DEVICE ID",
         "split_plat": "🤖 SPLIT ANDROID / iOS",
         "split_dedup": "🗑️ DEDUP + EXPORT FULL INFO",
     }.get(mode, "SPLIT")
-    await edit_or_send(update, context,
-        f"✂️ *{mode_label}*\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"Kirim file *.txt* berisi Device ID.\n\n"
-        f"Ketik angka (size per file), atau langsung kirim file untuk default 50.",
-        kb=cancel_kb())
+    await bot_edit_or_send(
+        update, context,
+        f"✂️ *{mode_label}*\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "Kirim file *.txt* berisi Device ID.\n\n"
+        "📦 Ukuran file default: 50 ID per file\n"
+        "Ketik angka dulu untuk mengubah (opsional), atau langsung kirim file.",
+        kb=bot_cancel_kb())
 
 
-# ──────────────────────────────────────────────────────────────────────
-# TEXT HANDLER
-# ──────────────────────────────────────────────────────────────────────
-async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ── Bot: text handler ───────────────────────────────────────────────
+async def bot_on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
-    if not is_owner(u.id):
+    if not bot_is_owner(u.id):
         return
-    s = get_state(u.id)
+    st = bot_get_state(u.id)
     text = (update.message.text or "").strip()
-    awaiting = s.get("awaiting")
+    awaiting = st.get("awaiting")
 
     if awaiting == "valid_single":
-        s["awaiting"] = None
+        st["awaiting"] = None
         if not text.startswith(("and_", "ios_")):
-            await update.message.reply_text("❌ Device ID harus mulai `and_` atau `ios_`",
-                                            parse_mode="Markdown")
+            await update.message.reply_text(
+                "❌ Device ID harus mulai `and_` atau `ios_`",
+                parse_mode="Markdown")
             return
-        msg = await update.message.reply_text("⏳ *Checking...*", parse_mode="Markdown")
+        msg = await update.message.reply_text(
+            "⏳ *Checking valid...*", parse_mode="Markdown")
         loop = asyncio.get_running_loop()
-        data = await loop.run_in_executor(None, _run_valid_single, text)
-        if not data:
-            await msg.edit_text(f"❌ *LOGIN / VALIDATION FAILED*\n\n`{text[:60]}`",
-                                parse_mode="Markdown", reply_markup=back_kb())
+        data = await loop.run_in_executor(None, _bot_run_valid_single, text)
+        if not data or not data.get("account_id") or not data.get("zone_id"):
+            await msg.edit_text(
+                f"❌ *LOGIN / VALIDATION FAILED*\n\n`{text[:60]}`",
+                parse_mode="Markdown", reply_markup=bot_back_kb())
             return
         pd = data.get("player_data") or {}
-        text_out = (
-            f"✅ *VALID HIT*\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        out = (
+            "✅ *VALID HIT*\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"📱 *Device:*\n`{text[:60]}`\n\n"
             f"🆔 *Account:* `{data.get('account_id')}`\n"
             f"🌐 *Zone:* `{data.get('zone_id')}`\n"
@@ -1246,51 +2525,48 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🏆 *Rank:* {pd.get('current_rank', '-')}\n"
             f"⭐ *High Rank:* {pd.get('high_rank', '-')}"
         )
-        await msg.edit_text(text_out, parse_mode="Markdown", reply_markup=back_kb())
+        await msg.edit_text(out, parse_mode="Markdown",
+                            reply_markup=bot_back_kb())
         return
 
     if awaiting == "ban_single":
-        s["awaiting"] = None
+        st["awaiting"] = None
         if not text.startswith(("and_", "ios_")):
             await update.message.reply_text("❌ Device ID invalid.")
             return
-        msg = await update.message.reply_text("⏳ *Checking ban status...*", parse_mode="Markdown")
+        msg = await update.message.reply_text(
+            "⏳ *Checking ban status...*", parse_mode="Markdown")
         loop = asyncio.get_running_loop()
-        status, result = await loop.run_in_executor(None, check_device_ban_silent, text)
+        status, result = await loop.run_in_executor(
+            None, _bot_run_ban_single, text)
         if status == "BANNED":
             out = f"🚫 *BANNED*\n\n`{result}`"
         elif status == "CLEAN":
             out = f"✅ *NOT BANNED*\n\n`{result}`"
         else:
             out = f"⚠️ *UNKNOWN / CHECK FAILED*\n\n`{result}`"
-        await msg.edit_text(out, parse_mode="Markdown", reply_markup=back_kb())
+        await msg.edit_text(out, parse_mode="Markdown",
+                            reply_markup=bot_back_kb())
         return
 
-    if awaiting == "split_file":
+    if awaiting == "split":
         if text.isdigit():
-            s["split_size"] = int(text)
+            st["split_size"] = int(text)
             await update.message.reply_text(
-                f"✅ Size: {s['split_size']} ID per file.\nSekarang kirim file *.txt*",
-                reply_markup=cancel_kb())
+                f"✅ Size: {st['split_size']} ID per file.\nSekarang kirim file *.txt*",
+                reply_markup=bot_cancel_kb())
             return
 
 
-def _run_valid_single(device_id):
-    bot = GameLogin(device_id)
-    return bot.run()
-
-
-# ──────────────────────────────────────────────────────────────────────
-# DOCUMENT HANDLER
-# ──────────────────────────────────────────────────────────────────────
-async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ── Bot: document handler ───────────────────────────────────────────
+async def bot_on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
-    if not is_owner(u.id):
+    if not bot_is_owner(u.id):
         return
-    s = get_state(u.id)
-    awaiting = s.get("awaiting")
+    st = bot_get_state(u.id)
+    awaiting = st.get("awaiting")
     doc = update.message.document
-    fname = doc.file_name.lower()
+    fname = (doc.file_name or "").lower()
 
     if not (fname.endswith(".txt") or fname.endswith(".json")):
         await update.message.reply_text("⚠️ File harus *.txt* atau *.json*")
@@ -1298,237 +2574,134 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if doc.file_size and doc.file_size > MAX_FILE_SIZE:
         await update.message.reply_text(
-            f"⚠️ File terlalu besar (max 20 MB).\nUkuran file: {doc.file_size / 1024 / 1024:.1f} MB")
+            f"⚠️ File terlalu besar (max 20 MB).\n"
+            f"Ukuran file: {doc.file_size / 1024 / 1024:.2f} MB")
         return
 
-    f = await doc.get_file()
-    raw = await f.download_as_bytearray()
-    text = raw.decode("utf-8", errors="ignore")
+    try:
+        f = await doc.get_file()
+        raw = await f.download_as_bytearray()
+        text = raw.decode("utf-8", errors="ignore")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Gagal membaca file: {e}")
+        return
 
-    if awaiting == "valid_bulk_file":
-        s["awaiting"] = None
-        devices = read_device_ids_from_text(text)
+    if awaiting == "valid_bulk":
+        st["awaiting"] = None
+        devices = read_device_ids_from_text_verif(text)
         if not devices:
-            await update.message.reply_text("❌ Tidak ada Device ID valid di file.")
+            await update.message.reply_text(
+                "❌ Tidak ada Device ID valid di file.")
             return
         msg = await update.message.reply_text(
             f"📦 *BULK VALID CHECK*\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"📄 File : `{doc.file_name}`\n"
             f"📱 Total: `{len(devices)}` device\n"
-            f"🧵 Threads: `{BULK_THREADS}`\n\n"
+            f"🧵 Threads: `20`\n\n"
             f"⏳ *Memproses...*",
             parse_mode="Markdown")
-        asyncio.create_task(run_bulk_valid(update, context, u.id, devices, msg))
+        asyncio.create_task(bot_bulk_valid(update, context, u.id, devices, msg))
         return
 
-    if awaiting == "ban_bulk_file":
-        s["awaiting"] = None
-        devices = read_device_ids_from_text(text)
+    if awaiting == "ban_bulk":
+        st["awaiting"] = None
+        devices = read_device_ids_from_text_verif(text)
         if not devices:
-            await update.message.reply_text("❌ Tidak ada Device ID valid di file.")
+            await update.message.reply_text(
+                "❌ Tidak ada Device ID valid di file.")
             return
         msg = await update.message.reply_text(
             f"🚫 *BULK BAN CHECK*\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"📄 File : `{doc.file_name}`\n"
             f"📱 Total: `{len(devices)}` device\n"
-            f"🧵 Threads: `{BULK_THREADS}`\n\n"
+            f"🧵 Threads: `20`\n\n"
             f"⏳ *Memproses...*",
             parse_mode="Markdown")
-        asyncio.create_task(run_bulk_ban(update, context, u.id, devices, msg))
+        asyncio.create_task(bot_bulk_ban(update, context, u.id, devices, msg))
         return
 
-    if awaiting == "fullcheck_file":
-        s["awaiting"] = None
-        devices = read_device_ids_from_text(text)
+    if awaiting == "verif_bulk":
+        st["awaiting"] = None
+        devices = read_device_ids_from_text_verif(text)
         if not devices:
-            await update.message.reply_text("❌ Tidak ada Device ID valid di file.")
-            return
-        msg = await update.message.reply_text(
-            f"🔥 *FULL CHECK — VALID + BAN*\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"📄 File : `{doc.file_name}`\n"
-            f"📱 Total: `{len(devices)}` device\n"
-            f"🧵 Threads: `{BULK_THREADS}`\n\n"
-            f"⏳ *Tahap 1: Scan device valid...*",
-            parse_mode="Markdown")
-        asyncio.create_task(run_fullcheck(update, context, u.id, devices, msg))
-        return
-
-    if awaiting == "verif_bulk_file":
-        s["awaiting"] = None
-        devices = read_device_ids_from_text(text)
-        if not devices:
-            await update.message.reply_text("❌ Tidak ada Device ID valid di file.")
+            await update.message.reply_text(
+                "❌ Tidak ada Device ID valid di file.")
             return
         msg = await update.message.reply_text(
             f"⚡ *4 VERIFIKASI LANGKAH — 3X SCAN*\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"📄 File : `{doc.file_name}`\n"
             f"📱 Total: `{len(devices)}` device\n"
-            f"🧵 Threads: `{BULK_THREADS}`\n"
+            f"🧵 Threads: `{VERIF_THREADS}`\n"
             f"📦 Max: `20 MB`\n\n"
             f"🔄 *SCAN 1/3 — Cek Valid...*",
             parse_mode="Markdown")
-        asyncio.create_task(run_verif_3x(update, context, u.id, devices, msg))
+        asyncio.create_task(
+            bot_verif_3x(update, context, u.id, devices, msg))
         return
 
-    if awaiting == "split_file":
-        s["awaiting"] = None
-        size = s.pop("split_size", 50)
-        mode = s.get("split_mode")
-        s["split_mode"] = None
+    if awaiting == "split":
+        st["awaiting"] = None
+        size = st.pop("split_size", 50)
+        mode = st.get("split_mode")
+        st["split_mode"] = None
         records = extract_records(text)
         if not records:
             await update.message.reply_text("❌ Tidak ada record valid.")
             return
         clean, duplicates = unique_records_keep_order(records)
         if not clean:
-            await update.message.reply_text("❌ Semua record duplikat / tidak valid.")
+            await update.message.reply_text(
+                "❌ Semua record duplikat / tidak valid.")
             return
-        msg = await update.message.reply_text("⏳ *Memproses split...*", parse_mode="Markdown")
-        await _do_split_async(update, context, clean, duplicates, mode, size, msg)
+        msg = await update.message.reply_text(
+            "⏳ *Memproses split...*", parse_mode="Markdown")
+        await bot_do_split(update, context, clean, duplicates, mode, size, msg)
         return
 
-    devices = read_device_ids_from_text(text)
+    # Fallback: file dikirim tanpa state
+    devices = read_device_ids_from_text_verif(text)
     if devices:
         await update.message.reply_text(
             f"ℹ️ File terdeteksi berisi `{len(devices)}` Device ID.\n\n"
             f"Pilih menu dulu:\n"
             f"  ✅ CEK VALID → BULK\n"
             f"  🚫 CEK BAN → BULK\n"
-            f"  🔥 FULL CHECK → BULK\n"
             f"  ⚡ 4 VERIFIKASI → BULK\n"
             f"  ✂️ SPLIT",
-            parse_mode="Markdown", reply_markup=back_kb())
+            parse_mode="Markdown", reply_markup=bot_back_kb())
     else:
         await update.message.reply_text(
             "ℹ️ File diterima, tapi tidak ada Device ID valid.\nPilih menu dulu.",
-            reply_markup=back_kb())
+            reply_markup=bot_back_kb())
 
 
-# ──────────────────────────────────────────────────────────────────────
-# SPLIT HANDLER
-# ──────────────────────────────────────────────────────────────────────
-async def _do_split_async(update, context, clean, duplicates, mode, size, msg):
-    cid = txt(update)
-    out_dir = RESULTS / "split"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    for old in out_dir.glob("*.txt"):
-        try:
-            old.unlink()
-        except Exception:
-            pass
-
-    def write_chunks(items, prefix, full_info=False):
-        parts = 0
-        for start in range(0, len(items), size):
-            parts += 1
-            chunk = items[start:start + size]
-            path = out_dir / f"{prefix}_{parts:03d}.txt"
-            with path.open("w", encoding="utf-8") as f:
-                for idx, item in enumerate(chunk, start=1):
-                    if full_info:
-                        lines = item["text"].splitlines()
-                        if lines:
-                            f.write(f"{idx}. {lines[0]}\n")
-                            for line in lines[1:]:
-                                f.write(line + "\n")
-                        f.write("---\n")
-                    else:
-                        f.write(item + "\n")
-        return parts
-
-    try:
-        if mode == "split_full":
-            parts = write_chunks(clean, "full_info", full_info=True)
-            await msg.edit_text(
-                f"✅ *SPLIT FULL INFO*\n\n📄 Total: `{len(clean)}`\n🔢 File: `{parts}`",
-                parse_mode="Markdown", reply_markup=back_kb())
-        elif mode == "split_devid":
-            ids = [r["id"] for r in clean]
-            parts = write_chunks(ids, "device_id")
-            await msg.edit_text(
-                f"✅ *SPLIT DEVICE ID*\n\n📄 Total: `{len(ids)}`\n🔢 File: `{parts}`",
-                parse_mode="Markdown", reply_markup=back_kb())
-        elif mode == "split_plat":
-            ids_and = [r["id"] for r in clean if r["id"].lower().startswith("and_")]
-            ids_ios = [r["id"] for r in clean if r["id"].lower().startswith("ios_")]
-            parts_and = write_chunks(ids_and, "android_and")
-            parts_ios = write_chunks(ids_ios, "ios")
-            await msg.edit_text(
-                f"✅ *SPLIT ANDROID / iOS*\n\n🤖 Android: `{len(ids_and)}` ID / `{parts_and}` file\n"
-                f"🍎 iOS: `{len(ids_ios)}` ID / `{parts_ios}` file",
-                parse_mode="Markdown", reply_markup=back_kb())
-        elif mode == "split_dedup":
-            results_dir = RESULTS
-            android = [r for r in clean if r["id"].lower().startswith("and_")]
-            ios = [r for r in clean if r["id"].lower().startswith("ios_")]
-
-            def save_num(path, recs):
-                with path.open("w", encoding="utf-8") as f:
-                    for i, record in enumerate(recs, 1):
-                        lines = record["text"].splitlines()
-                        if lines:
-                            f.write(f"{i}. {lines[0]}\n")
-                            for line in lines[1:]:
-                                f.write(line + "\n")
-                        f.write("---\n")
-
-            save_num(results_dir / "all_devices.txt", clean)
-            save_num(results_dir / "android_and.txt", android)
-            save_num(results_dir / "ios.txt", ios)
-
-            await msg.edit_text(
-                f"✅ *DEDUP + EXPORT FULL INFO*\n\n📄 Total unik: `{len(clean)}`\n"
-                f"🗑️ Duplikat: `{duplicates}`",
-                parse_mode="Markdown", reply_markup=back_kb())
-
-        try:
-            zip_path = out_dir / "_all_split.zip"
-            with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-                for fp in out_dir.glob("*.txt"):
-                    zf.write(fp, arcname=fp.name)
-            with open(zip_path, "rb") as f:
-                await context.bot.send_document(
-                    chat_id=cid, document=InputFile(f, filename="_all_split.zip"),
-                    caption=f"📦 *Semua file split* ({len(clean)} record)",
-                    parse_mode="Markdown")
-        except Exception as e:
-            print(f"[SPLIT] zip err: {e}")
-    except Exception as e:
-        await msg.edit_text(f"❌ Error: {e}", reply_markup=back_kb())
-
-
-# ──────────────────────────────────────────────────────────────────────
-# BULK RUNNERS
-# ──────────────────────────────────────────────────────────────────────
-async def run_bulk_valid(update, context, uid, devices, msg):
-    s = get_state(uid)
-    cid = txt(update)
+# ── Bot: bulk valid runner ──────────────────────────────────────────
+async def bot_bulk_valid(update, context, uid, devices, msg):
+    cid = msg.chat_id
     total = len(devices)
-    done = 0
+    loop = asyncio.get_running_loop()
+
     valid = 0
     fail = 0
-    last_edit = [0.0]
-    loop = asyncio.get_running_loop()
+    done = 0
     results = []
     lock = threading.Lock()
+    last_edit = [0.0]
 
     def worker(d):
         try:
-            return d, _run_valid_single(d)
+            return d, _bot_run_valid_single(d)
         except Exception:
             return d, None
 
     def bulk_run():
-        nonlocal done, valid, fail
-        with ThreadPoolExecutor(max_workers=BULK_THREADS) as ex:
+        nonlocal valid, fail, done
+        with concurrent.futures.ThreadPoolExecutor(max_workers=20) as ex:
             futures = {ex.submit(worker, d): d for d in devices}
-            for fut in as_completed(futures):
-                if s.get("bulk_stop"):
-                    break
+            for fut in concurrent.futures.as_completed(futures):
                 try:
                     d, data = fut.result()
                 except Exception:
@@ -1541,36 +2714,33 @@ async def run_bulk_valid(update, context, uid, devices, msg):
                         fail += 1
                     done += 1
 
-    async def update_status():
+    future = loop.run_in_executor(None, bulk_run)
+    while not future.done():
         now = time.time()
-        if now - last_edit[0] < 2.0 and done < total:
-            return
-        last_edit[0] = now
-        pct = int(done / max(total, 1) * 100)
-        bar = "▰" * int(pct / 10) + "▱" * (10 - int(pct / 10))
-        try:
-            await context.bot.edit_message_text(
-                chat_id=cid, message_id=msg.message_id,
-                text=(f"📦 *BULK VALID CHECK*\n"
-                      f"━━━━━━━━━━━━━━━━━━━━\n"
-                      f"📊 Progress: `{done}/{total}` ({pct}%)\n"
-                      f"`{bar}`\n\n"
-                      f"✅ Valid  : `{valid}`\n"
-                      f"❌ Failed : `{fail}`"),
-                parse_mode="Markdown")
-        except Exception:
-            pass
-
-    bulk_future = loop.run_in_executor(None, bulk_run)
-    while not bulk_future.done():
-        await update_status()
+        if now - last_edit[0] >= 2.0:
+            last_edit[0] = now
+            pct = int(done / max(total, 1) * 100)
+            bar = "▰" * int(pct / 10) + "▱" * (10 - int(pct / 10))
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=cid, message_id=msg.message_id,
+                    text=(f"📦 *BULK VALID CHECK*\n"
+                          f"━━━━━━━━━━━━━━━━━━━━\n"
+                          f"📊 Progress: `{done}/{total}` ({pct}%)\n"
+                          f"`{bar}`\n\n"
+                          f"✅ Valid  : `{valid}`\n"
+                          f"❌ Failed : `{fail}`"),
+                    parse_mode="Markdown")
+            except Exception:
+                pass
         await asyncio.sleep(1.0)
-    await bulk_future
-    await update_status()
+    try:
+        await future
+    except Exception:
+        pass
 
-    # Kirim file hasil
     buf = io.StringIO()
-    buf.write(f"# WEIRDMARKET — HASIL BULK VALID\n")
+    buf.write("# WEIRDMARKET — HASIL BULK VALID\n")
     buf.write(f"# Total: {total} | Valid: {valid} | Failed: {fail}\n\n")
     for d, data in results:
         pd = data.get("player_data") or {}
@@ -1598,16 +2768,7 @@ async def run_bulk_valid(update, context, uid, devices, msg):
                          f"❌ Failed : `{fail}`"),
                 parse_mode="Markdown")
         except Exception as e:
-            print(f"[BULK VALID] send doc err: {e}")
-            await context.bot.send_message(
-                chat_id=cid,
-                text=f"✅ *BULK VALID SELESAI*\n\n"
-                     f"📱 Total  : `{total}`\n"
-                     f"✅ Valid  : `{valid}`\n"
-                     f"❌ Failed : `{fail}`\n\n"
-                     f"⚠️ File gagal dikirim: {e}",
-                parse_mode="Markdown", reply_markup=back_kb())
-            return
+            print(f"[BOT BULK VALID] send doc err: {e}")
 
     try:
         await context.bot.edit_message_text(
@@ -1617,26 +2778,26 @@ async def run_bulk_valid(update, context, uid, devices, msg):
                   f"📱 Total  : `{total}`\n"
                   f"✅ Valid  : `{valid}`\n"
                   f"❌ Failed : `{fail}`"),
-            parse_mode="Markdown", reply_markup=back_kb())
+            parse_mode="Markdown", reply_markup=bot_back_kb())
     except Exception:
         pass
 
 
-async def run_bulk_ban(update, context, uid, devices, msg):
-    s = get_state(uid)
-    cid = txt(update)
+# ── Bot: bulk ban runner ────────────────────────────────────────────
+async def bot_bulk_ban(update, context, uid, devices, msg):
+    cid = msg.chat_id
     total = len(devices)
-    done = 0
+    loop = asyncio.get_running_loop()
+
     banned = 0
     clean = 0
     unknown = 0
-    last_edit = [0.0]
-    loop = asyncio.get_running_loop()
-
+    done = 0
     banned_lines = []
     clean_lines = []
     unknown_lines = []
     lock = threading.Lock()
+    last_edit = [0.0]
 
     def worker(d):
         try:
@@ -1645,12 +2806,10 @@ async def run_bulk_ban(update, context, uid, devices, msg):
             return "UNKNOWN", d
 
     def bulk_run():
-        nonlocal done, banned, clean, unknown
-        with ThreadPoolExecutor(max_workers=BULK_THREADS) as ex:
+        nonlocal banned, clean, unknown, done
+        with concurrent.futures.ThreadPoolExecutor(max_workers=20) as ex:
             futures = {ex.submit(worker, d): d for d in devices}
-            for fut in as_completed(futures):
-                if s.get("bulk_stop"):
-                    break
+            for fut in concurrent.futures.as_completed(futures):
                 try:
                     status, result = fut.result()
                 except Exception:
@@ -1667,37 +2826,36 @@ async def run_bulk_ban(update, context, uid, devices, msg):
                         unknown_lines.append(result)
                     done += 1
 
-    async def update_status():
+    future = loop.run_in_executor(None, bulk_run)
+    while not future.done():
         now = time.time()
-        if now - last_edit[0] < 2.0 and done < total:
-            return
-        last_edit[0] = now
-        pct = int(done / max(total, 1) * 100)
-        bar = "▰" * int(pct / 10) + "▱" * (10 - int(pct / 10))
-        try:
-            await context.bot.edit_message_text(
-                chat_id=cid, message_id=msg.message_id,
-                text=(f"🚫 *BULK BAN CHECK*\n"
-                      f"━━━━━━━━━━━━━━━━━━━━\n"
-                      f"📊 Progress: `{done}/{total}` ({pct}%)\n"
-                      f"`{bar}`\n\n"
-                      f"🚫 Banned  : `{banned}`\n"
-                      f"✅ Clean   : `{clean}`\n"
-                      f"⚠️ Unknown : `{unknown}`"),
-                parse_mode="Markdown")
-        except Exception:
-            pass
-
-    bulk_future = loop.run_in_executor(None, bulk_run)
-    while not bulk_future.done():
-        await update_status()
+        if now - last_edit[0] >= 2.0:
+            last_edit[0] = now
+            pct = int(done / max(total, 1) * 100)
+            bar = "▰" * int(pct / 10) + "▱" * (10 - int(pct / 10))
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=cid, message_id=msg.message_id,
+                    text=(f"🚫 *BULK BAN CHECK*\n"
+                          f"━━━━━━━━━━━━━━━━━━━━\n"
+                          f"📊 Progress: `{done}/{total}` ({pct}%)\n"
+                          f"`{bar}`\n\n"
+                          f"🚫 Banned  : `{banned}`\n"
+                          f"✅ Clean   : `{clean}`\n"
+                          f"⚠️ Unknown : `{unknown}`"),
+                    parse_mode="Markdown")
+            except Exception:
+                pass
         await asyncio.sleep(1.0)
-    await bulk_future
-    await update_status()
+    try:
+        await future
+    except Exception:
+        pass
 
     buf = io.StringIO()
-    buf.write(f"# WEIRDMARKET — HASIL BULK BAN\n")
-    buf.write(f"# Total: {total} | Banned: {banned} | Clean: {clean} | Unknown: {unknown}\n\n")
+    buf.write("# WEIRDMARKET — HASIL BULK BAN\n")
+    buf.write(
+        f"# Total: {total} | Banned: {banned} | Clean: {clean} | Unknown: {unknown}\n\n")
     buf.write("═════ BANNED ═════\n")
     for l in banned_lines: buf.write(l + "\n")
     buf.write("\n═════ CLEAN ═════\n")
@@ -1717,17 +2875,7 @@ async def run_bulk_ban(update, context, uid, devices, msg):
                          f"⚠️ Unknown: `{unknown}`"),
                 parse_mode="Markdown")
         except Exception as e:
-            print(f"[BULK BAN] send doc err: {e}")
-            await context.bot.send_message(
-                chat_id=cid,
-                text=f"🚫 *BULK BAN SELESAI*\n\n"
-                     f"📱 Total  : `{total}`\n"
-                     f"🚫 Banned : `{banned}`\n"
-                     f"✅ Clean  : `{clean}`\n"
-                     f"⚠️ Unknown: `{unknown}`\n\n"
-                     f"⚠️ File gagal dikirim: {e}",
-                parse_mode="Markdown", reply_markup=back_kb())
-            return
+            print(f"[BOT BULK BAN] send doc err: {e}")
 
     try:
         await context.bot.edit_message_text(
@@ -1738,472 +2886,76 @@ async def run_bulk_ban(update, context, uid, devices, msg):
                   f"🚫 Banned : `{banned}`\n"
                   f"✅ Clean  : `{clean}`\n"
                   f"⚠️ Unknown: `{unknown}`"),
-            parse_mode="Markdown", reply_markup=back_kb())
+            parse_mode="Markdown", reply_markup=bot_back_kb())
     except Exception:
         pass
 
 
-# ──────────────────────────────────────────────────────────────────────
-# FULL CHECK RUNNER (VALID + BAN)
-# ──────────────────────────────────────────────────────────────────────
-async def run_fullcheck(update, context, uid, devices, msg):
-    s = get_state(uid)
-    cid = txt(update)
+# ── Bot: 3x verif runner ────────────────────────────────────────────
+async def bot_verif_3x(update, context, uid, devices, msg):
+    cid = msg.chat_id
     total = len(devices)
     loop = asyncio.get_running_loop()
 
-    final_clean: List[Tuple[str, dict]] = []
-    final_banned: List[str] = []
-    final_unknown_ban: List[str] = []
-    valid_fail_count = 0
-    valid_total = 0
-    done_valid = 0
-    last_edit = [0.0]
-
-    lock_valid = threading.Lock()
-    lock_ban = threading.Lock()
-    valid_buffer: List[Tuple[str, dict]] = []
-    valid_buffer_lock = threading.Lock()
-
-    async def flush_ban_buffer(buffer_snapshot: List[Tuple[str, dict]]):
-        if not buffer_snapshot:
-            return
-        nonlocal valid_total
-        total_buf = len(buffer_snapshot)
-        done_ban = 0
-        banned_cnt = 0
-        clean_cnt = 0
-        unknown_cnt = 0
-        last_ban_edit = [0.0]
-
-        def worker_ban(dev):
-            try:
-                return check_device_ban_silent(dev)
-            except Exception:
-                return "UNKNOWN", dev
-
-        def bulk_ban_run():
-            nonlocal done_ban, banned_cnt, clean_cnt, unknown_cnt
-            with ThreadPoolExecutor(max_workers=BULK_THREADS) as ex:
-                futures = {ex.submit(worker_ban, d): d for d, _ in buffer_snapshot}
-                for fut in as_completed(futures):
-                    if s.get("bulk_stop"):
-                        break
-                    try:
-                        status, result = fut.result()
-                    except Exception:
-                        status, result = "UNKNOWN", futures[fut]
-                    with lock_ban:
-                        if status == "BANNED":
-                            banned_cnt += 1
-                            final_banned.append(result)
-                        elif status == "CLEAN":
-                            clean_cnt += 1
-                            for d_id, data in buffer_snapshot:
-                                if d_id == result:
-                                    final_clean.append((d_id, data))
-                                    break
-                        else:
-                            unknown_cnt += 1
-                            final_unknown_ban.append(result)
-                        done_ban += 1
-
-        try:
-            await context.bot.edit_message_text(
-                chat_id=cid, message_id=msg.message_id,
-                text=(f"🔥 *FULL CHECK — TAHAP 2/2 (BAN)*\n"
-                      f"━━━━━━━━━━━━━━━━━━━━\n"
-                      f"✅ Valid ditemukan: `{valid_total}`\n"
-                      f"🧪 Batch size    : `{total_buf}`\n"
-                      f"⏳ *Memproses cek ban...*"),
-                parse_mode="Markdown")
-        except Exception:
-            pass
-
-        ban_future = loop.run_in_executor(None, bulk_ban_run)
-        while not ban_future.done():
-            now = time.time()
-            if now - last_ban_edit[0] >= 2.0:
-                last_ban_edit[0] = now
-                pct = int(done_ban / max(total_buf, 1) * 100)
-                bar = "▰" * int(pct / 10) + "▱" * (10 - int(pct / 10))
-                try:
-                    await context.bot.edit_message_text(
-                        chat_id=cid, message_id=msg.message_id,
-                        text=(f"🔥 *FULL CHECK — TAHAP 2/2 (BAN)*\n"
-                              f"━━━━━━━━━━━━━━━━━━━━\n"
-                              f"📊 Batch: `{done_ban}/{total_buf}` ({pct}%)\n"
-                              f"`{bar}`\n\n"
-                              f"🚫 Banned  : `{banned_cnt}`\n"
-                              f"✅ Clean   : `{clean_cnt}`\n"
-                              f"⚠️ Unknown : `{unknown_cnt}`"),
-                        parse_mode="Markdown")
-                except Exception:
-                    pass
-            await asyncio.sleep(1.0)
-        await ban_future
-
-    def worker_valid(d):
-        try:
-            return d, _run_valid_single(d)
-        except Exception:
-            return d, None
-
-    def bulk_valid_run():
-        nonlocal done_valid, valid_total, valid_fail_count
-        with ThreadPoolExecutor(max_workers=BULK_THREADS) as ex:
-            futures = {ex.submit(worker_valid, d): d for d in devices}
-            for fut in as_completed(futures):
-                if s.get("bulk_stop"):
-                    break
-                try:
-                    d, data = fut.result()
-                except Exception:
-                    d, data = futures[fut], None
-                with lock_valid:
-                    if data and data.get("account_id") and data.get("zone_id"):
-                        valid_total += 1
-                        valid_buffer.append((d, data))
-                    else:
-                        valid_fail_count += 1
-                    done_valid += 1
-
-    async def update_status_valid():
-        now = time.time()
-        if now - last_edit[0] < 2.0 and done_valid < total:
-            return
-        last_edit[0] = now
-        pct = int(done_valid / max(total, 1) * 100)
-        bar = "▰" * int(pct / 10) + "▱" * (10 - int(pct / 10))
-        try:
-            await context.bot.edit_message_text(
-                chat_id=cid, message_id=msg.message_id,
-                text=(f"🔥 *FULL CHECK — TAHAP 1/2 (VALID)*\n"
-                      f"━━━━━━━━━━━━━━━━━━━━\n"
-                      f"📊 Progress: `{done_valid}/{total}` ({pct}%)\n"
-                      f"`{bar}`\n\n"
-                      f"✅ Valid  : `{valid_total}`\n"
-                      f"❌ Failed : `{valid_fail_count}`\n"
-                      f"📥 Buffer : `{len(valid_buffer)}/{FULLCHECK_BATCH_SIZE}`"),
-                parse_mode="Markdown")
-        except Exception:
-            pass
-
-    valid_future = loop.run_in_executor(None, bulk_valid_run)
-
-    while True:
-        if valid_future.done():
-            break
-        await update_status_valid()
-        snapshot = None
-        with valid_buffer_lock:
-            if len(valid_buffer) >= FULLCHECK_BATCH_SIZE:
-                snapshot = valid_buffer[:FULLCHECK_BATCH_SIZE]
-                del valid_buffer[:FULLCHECK_BATCH_SIZE]
-        if snapshot:
-            await flush_ban_buffer(snapshot)
-        await asyncio.sleep(1.0)
-
-    try:
-        await valid_future
-    except Exception:
-        pass
-
-    remaining = []
-    with valid_buffer_lock:
-        remaining = list(valid_buffer)
-        valid_buffer.clear()
-
-    if remaining:
-        await flush_ban_buffer(remaining)
-
-    await update_status_valid()
-
-    total_clean = len(final_clean)
-    total_banned = len(final_banned)
-    total_unknown = len(final_unknown_ban)
-
-    buf = io.StringIO()
-    buf.write("═" * 60 + "\n")
-    buf.write("WEIRDMARKET — FULL CHECK (VALID + BAN)\n")
-    buf.write("═" * 60 + "\n")
-    buf.write(f"Total Input     : {total}\n")
-    buf.write(f"Valid Device    : {valid_total}\n")
-    buf.write(f"Invalid Device  : {valid_fail_count}\n")
-    buf.write(f"Banned          : {total_banned}\n")
-    buf.write(f"Clean (Not Ban) : {total_clean}\n")
-    buf.write(f"Unknown         : {total_unknown}\n")
-    buf.write("═" * 60 + "\n\n")
-
-    buf.write("┌──────────────────────────────────────────────┐\n")
-    buf.write("│  🚫 BANNED ACCOUNTS                          │\n")
-    buf.write("└──────────────────────────────────────────────┘\n")
-    for l in final_banned:
-        buf.write(l + "\n")
-    buf.write("\n")
-
-    buf.write("┌──────────────────────────────────────────────┐\n")
-    buf.write("│  ✅ CLEAN ACCOUNTS (FINAL RESULT)            │\n")
-    buf.write("└──────────────────────────────────────────────┘\n")
-    for d_id, data in final_clean:
-        pd = data.get("player_data") or {}
-        buf.write(
-            f"DEVICE ID  : {d_id}\n"
-            f"ACCOUNT ID : {data.get('account_id')}\n"
-            f"ZONE ID    : {data.get('zone_id')}\n"
-            f"NICKNAME   : {pd.get('nickname', '-')}\n"
-            f"LEVEL      : {pd.get('level', 0)}\n"
-            f"SKIN       : {pd.get('skin_count', 0)}\n"
-            f"HERO       : {pd.get('hero_count', 0)}\n"
-            f"RANK       : {pd.get('current_rank', '-')}\n"
-            f"HIGH RANK  : {pd.get('high_rank', '-')}\n"
-            f"{'-' * 58}\n"
-        )
-    buf.write("\n")
-
-    buf.write("┌──────────────────────────────────────────────┐\n")
-    buf.write("│  ⚠️ UNKNOWN ACCOUNTS                         │\n")
-    buf.write("└──────────────────────────────────────────────┘\n")
-    for l in final_unknown_ban:
-        buf.write(l + "\n")
-    buf.write("\n")
-
-    out = io.BytesIO(buf.getvalue().encode("utf-8"))
-    try:
-        await context.bot.send_document(
-            chat_id=cid,
-            document=InputFile(out, filename="FULL_CHECK_RESULTS.txt"),
-            caption=(f"🔥 *FULL CHECK SELESAI*\n"
-                     f"━━━━━━━━━━━━━━━━━━━━\n"
-                     f"📱 Total  : `{total}`\n"
-                     f"✅ Valid  : `{valid_total}`\n"
-                     f"🚫 Banned : `{total_banned}`\n"
-                     f"✅ Clean  : `{total_clean}`\n"
-                     f"⚠️ Unknown: `{total_unknown}`"),
-            parse_mode="Markdown")
-    except Exception as e:
-        print(f"[FULLCHECK] send doc err: {e}")
-        await context.bot.send_message(
-            chat_id=cid,
-            text=f"🔥 *FULL CHECK SELESAI*\n\n"
-                 f"📱 Total  : `{total}`\n"
-                 f"✅ Valid  : `{valid_total}`\n"
-                 f"🚫 Banned : `{total_banned}`\n"
-                 f"✅ Clean  : `{total_clean}`\n"
-                 f"⚠️ Unknown: `{total_unknown}`\n\n"
-                 f"⚠️ File gagal dikirim: {e}",
-            parse_mode="Markdown", reply_markup=back_kb())
-        return
-
-    try:
-        await context.bot.edit_message_text(
-            chat_id=cid, message_id=msg.message_id,
-            text=(f"🏁 *FULL CHECK SELESAI*\n"
-                  f"━━━━━━━━━━━━━━━━━━━━\n"
-                  f"📱 Total  : `{total}`\n"
-                  f"✅ Valid  : `{valid_total}`\n"
-                  f"🚫 Banned : `{total_banned}`\n"
-                  f"✅ Clean  : `{total_clean}`\n"
-                  f"⚠️ Unknown: `{total_unknown}`"),
-            parse_mode="Markdown", reply_markup=back_kb())
-    except Exception:
-        pass
-
-
-# ══════════════════════════════════════════════════════════════════════
-# FITUR NOMOR 4 — 4 VERIFIKASI LANGKAH (3X SCAN)
-# ══════════════════════════════════════════════════════════════════════
-async def _verif_single_scan(context, cid, msg_id, scan_no, devices, s, loop, total):
-    """
-    Jalankan satu siklus scan lengkap (Valid -> Banned).
-    Return: dict { device_id: {"valid": bool, "ban_status": "BANNED"/"CLEAN"/"UNKNOWN"/None,
-                              "ban_string": str/None, "data": dict/None} }
-    Menggunakan mekanisme ASLI dari fitur Cek Valid Single & Cek Banned Single.
-    """
-    valid_devs: List[Tuple[str, dict]] = []
-    invalid_devs: List[str] = []
-    done_v = [0]
-    last_v = [0.0]
-    v_lock = threading.Lock()
-
-    # ---------- Langkah 1: Valid ----------
-    def worker_v(d):
-        try:
-            return d, _run_valid_single(d)
-        except Exception:
-            return d, None
-
-    def bulk_valid():
-        with ThreadPoolExecutor(max_workers=BULK_THREADS) as ex:
-            futures = {ex.submit(worker_v, d): d for d in devices}
-            for fut in as_completed(futures):
-                if s.get("bulk_stop"):
-                    break
-                try:
-                    d, data = fut.result()
-                except Exception:
-                    d, data = futures[fut], None
-                with v_lock:
-                    if data and data.get("account_id") and data.get("zone_id"):
-                        valid_devs.append((d, data))
-                    else:
-                        invalid_devs.append(d)
-                    done_v[0] += 1
-
-    vf = loop.run_in_executor(None, bulk_valid)
-    while not vf.done():
-        now = time.time()
-        if now - last_v[0] >= 2.0:
-            last_v[0] = now
-            pct = int(done_v[0] / max(total, 1) * 100)
-            bar = "▰" * int(pct / 10) + "▱" * (10 - int(pct / 10))
-            try:
-                await context.bot.edit_message_text(
-                    chat_id=cid, message_id=msg_id,
-                    text=(f"⚡ *4 VERIFIKASI LANGKAH — 3X SCAN*\n"
-                          f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                          f"🔄 *SCAN {scan_no}/3* — 🔍 Langkah 1: Cek Valid\n"
-                          f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                          f"📊 Progress: `{done_v[0]}/{total}` ({pct}%)\n"
-                          f"`{bar}`\n\n"
-                          f"✅ Valid  : `{len(valid_devs)}`\n"
-                          f"❌ Failed : `{len(invalid_devs)}`"),
-                    parse_mode="Markdown")
-            except Exception:
-                pass
-        await asyncio.sleep(1.0)
-    try:
-        await vf
-    except Exception:
-        pass
-
-    # ---------- Langkah 2: Banned (hanya untuk valid) ----------
-    ban_map: Dict[str, Tuple[str, str]] = {}
-    if valid_devs:
-        done_b = [0]
-        last_b = [0.0]
-        tb = len(valid_devs)
-        b_lock = threading.Lock()
-
-        def worker_b(dev):
-            try:
-                return check_device_ban_silent(dev)
-            except Exception:
-                return "UNKNOWN", dev
-
-        def bulk_ban():
-            with ThreadPoolExecutor(max_workers=BULK_THREADS) as ex:
-                futures = {ex.submit(worker_b, d): d for d, _ in valid_devs}
-                for fut in as_completed(futures):
-                    if s.get("bulk_stop"):
-                        break
-                    try:
-                        status, result = fut.result()
-                    except Exception:
-                        status, result = "UNKNOWN", futures[fut]
-                    with b_lock:
-                        ban_map[futures[fut]] = (status, result)
-                        done_b[0] += 1
-
-        bf = loop.run_in_executor(None, bulk_ban)
-        while not bf.done():
-            now = time.time()
-            if now - last_b[0] >= 2.0:
-                last_b[0] = now
-                pct = int(done_b[0] / max(tb, 1) * 100)
-                bar = "▰" * int(pct / 10) + "▱" * (10 - int(pct / 10))
-                try:
-                    await context.bot.edit_message_text(
-                        chat_id=cid, message_id=msg_id,
-                        text=(f"⚡ *4 VERIFIKASI LANGKAH — 3X SCAN*\n"
-                              f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                              f"🔄 *SCAN {scan_no}/3* — 🚫 Langkah 2: Cek Banned\n"
-                              f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                              f"📊 Progress: `{done_b[0]}/{tb}` ({pct}%)\n"
-                              f"`{bar}`"),
-                        parse_mode="Markdown")
-                except Exception:
-                    pass
-            await asyncio.sleep(1.0)
-        try:
-            await bf
-        except Exception:
-            pass
-
-    # ---------- Build result map ----------
-    result: Dict[str, dict] = {}
-    for d in devices:
-        result[d] = {"valid": False, "ban_status": None, "ban_string": None, "data": None}
-    for d, data in valid_devs:
-        result[d]["valid"] = True
-        result[d]["data"] = data
-    for d, (st, st_str) in ban_map.items():
-        if d in result:
-            result[d]["ban_status"] = st
-            result[d]["ban_string"] = st_str
-    return result
-
-
-async def run_verif_3x(update, context, uid, devices, msg):
-    """
-    Fitur Nomor 4 — 4 Verifikasi Langkah (3X Scan).
-    Scan 1, Scan 2, Scan 3 masing-masing menjalankan Cek Valid + Cek Banned.
-    Hasil dibandingkan, device dengan status konsisten dimasukkan ke file final.
-    """
-    s = get_state(uid)
-    cid = txt(update)
-    total = len(devices)
-    loop = asyncio.get_running_loop()
-
-    # ===== JALANKAN 3 SCAN =====
     scan_results: List[Dict[str, dict]] = []
     for i in (1, 2, 3):
+        header = {
+            1: "SCAN 1/3 — 🔍 Pemeriksaan Pertama",
+            2: "SCAN 2/3 — 🔄 Pengulangan Kedua",
+            3: "SCAN 3/3 — ✅ Pemeriksaan Terakhir",
+        }[i]
         try:
             await context.bot.edit_message_text(
                 chat_id=cid, message_id=msg.message_id,
                 text=(f"⚡ *4 VERIFIKASI LANGKAH — 3X SCAN*\n"
                       f"━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                      f"🔄 *Memulai SCAN {i}/3...*\n\n"
-                      f"📱 Total device: `{total}`\n"
-                      f"🧵 Threads     : `{BULK_THREADS}`"),
+                      f"🔄 *{header}*\n\n"
+                      f"📱 Total: `{total}` device\n"
+                      f"🧵 Threads: `{VERIF_THREADS}`\n\n"
+                      f"⏳ Menjalankan Cek Valid + Cek Banned..."),
                 parse_mode="Markdown")
         except Exception:
             pass
-        res = await _verif_single_scan(context, cid, msg.message_id, i, devices, s, loop, total)
+
+        # _verif_single_scan mencetak progress ke stdout (log), tetap return map
+        res = await loop.run_in_executor(
+            None, _verif_single_scan, devices, i, VERIF_THREADS)
         scan_results.append(res)
 
-        # Info selesai scan
         cnt_valid = sum(1 for d in devices if res[d]["valid"])
         cnt_ban = sum(1 for d in devices if res[d]["ban_status"] == "BANNED")
         cnt_clean = sum(1 for d in devices if res[d]["ban_status"] == "CLEAN")
+        cnt_unknown = sum(1 for d in devices if res[d]["ban_status"] == "UNKNOWN")
+
         try:
             await context.bot.edit_message_text(
                 chat_id=cid, message_id=msg.message_id,
                 text=(f"⚡ *4 VERIFIKASI LANGKAH — 3X SCAN*\n"
                       f"━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                      f"✅ *SCAN {i}/3 SELESAI*\n\n"
+                      f"✅ *{header} SELESAI*\n\n"
                       f"  🔍 Valid   : `{cnt_valid}`\n"
                       f"  🚫 Banned  : `{cnt_ban}`\n"
-                      f"  ✅ Clean   : `{cnt_clean}`\n"),
+                      f"  ✅ Clean   : `{cnt_clean}`\n"
+                      f"  ⚠️ Unknown : `{cnt_unknown}`"),
                 parse_mode="Markdown")
         except Exception:
             pass
         await asyncio.sleep(0.5)
 
-    # ===== BANDINGKAN HASIL =====
+    # Bandingkan
     try:
         await context.bot.edit_message_text(
             chat_id=cid, message_id=msg.message_id,
-            text=(f"⚡ *4 VERIFIKASI LANGKAH — 3X SCAN*\n"
-                  f"━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                  f"📊 *Membandingkan hasil 3 scan...*"),
+            text=("⚡ *4 VERIFIKASI LANGKAH — 3X SCAN*\n"
+                  "━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                  "📊 *Membandingkan hasil 3 scan...*"),
             parse_mode="Markdown")
     except Exception:
         pass
 
-    file_clean: List[Tuple[str, dict]] = []   # (device_id, data)
-    file_banned: List[str] = []                # ban string final
-    inconsistent: List[Tuple[str, str]] = []   # (device_id, reason)
+    file_clean: List[Tuple[str, dict]] = []
+    file_banned: List[Tuple[str, str]] = []
+    inconsistent: List[Tuple[str, str]] = []
     invalid_final: List[str] = []
 
     for d in devices:
@@ -2211,142 +2963,125 @@ async def run_verif_3x(update, context, uid, devices, msg):
         s2 = scan_results[1].get(d) or {}
         s3 = scan_results[2].get(d) or {}
 
-        v1 = bool(s1.get("valid")); v2 = bool(s2.get("valid")); v3 = bool(s3.get("valid"))
-        b1 = s1.get("ban_status"); b2 = s2.get("ban_status"); b3 = s3.get("ban_status")
+        v1 = bool(s1.get("valid"))
+        v2 = bool(s2.get("valid"))
+        v3 = bool(s3.get("valid"))
+        b1 = s1.get("ban_status")
+        b2 = s2.get("ban_status")
+        b3 = s3.get("ban_status")
 
-        # Wajib valid di semua 3 scan
         if not (v1 and v2 and v3):
             invalid_final.append(d)
             continue
 
-        statuses = [b1, b2, b3]
-
-        if all(x == "CLEAN" for x in statuses):
+        if b1 == "CLEAN" and b2 == "CLEAN" and b3 == "CLEAN":
             data = s3.get("data") or s2.get("data") or s1.get("data") or {}
             file_clean.append((d, data))
-        elif all(x == "BANNED" for x in statuses):
-            # Ambil ban string dari scan 3 (terbaru & terverifikasi)
-            bs = s3.get("ban_string") or s2.get("ban_string") or s1.get("ban_string")
-            if not bs:
-                bs = f"{d} |  Reason Name: Using Plug-in Apps to Compromise Competitive Fairness |  Duration: Day -, 00:00:00"
-            file_banned.append(bs)
+        elif b1 == "BANNED" and b2 == "BANNED" and b3 == "BANNED":
+            ban_str = (
+                s3.get("ban_string")
+                or s2.get("ban_string")
+                or s1.get("ban_string")
+            )
+            file_banned.append((d, _verif_ban_line(d, ban_str)))
         else:
-            # Cek apakah ada UNKNOWN -> tetap konsisten kalau UNKNOWN di semua
-            if all(x == "UNKNOWN" for x in statuses):
-                inconsistent.append((d, f"scan1={b1}, scan2={b2}, scan3={b3}"))
-            else:
-                inconsistent.append((d, f"scan1={b1}, scan2={b2}, scan3={b3}"))
+            reason = f"scan1={b1}, scan2={b2}, scan3={b3}"
+            inconsistent.append((d, reason))
 
-    # ===== BUILD FILE HASIL =====
     now = datetime.datetime.now()
-    date_str = now.strftime("%Y-%m-%d_%H-%M-%S")
-    ts_str = now.strftime("%Y-%m-%d %H:%M:%S")
+    tanggal = now.strftime("%Y-%m-%d")
+    waktu = now.strftime("%H-%M-%S")
+    ts_full = now.strftime("%Y-%m-%d %H:%M:%S")
 
-    # ----- FILE 1: TIDAK TERBANNED -----
+    fname1 = f"Device ID Tidak Terbanned {tanggal} {waktu}.txt"
+    fname2 = f"Device ID Sudah Terbanned {tanggal} {waktu}.txt"
+
+    # ── FILE 1 ──
     buf1 = io.StringIO()
     buf1.write("═" * 60 + "\n")
     buf1.write("WEIRDMARKET — DEVICE ID TIDAK TERBANNED\n")
     buf1.write("(Hasil Verifikasi 3X SCAN — Valid + Banned)\n")
     buf1.write("═" * 60 + "\n")
-    buf1.write(f"Timestamp       : {ts_str}\n")
+    buf1.write(f"Timestamp       : {ts_full}\n")
     buf1.write(f"Total Input     : {total}\n")
     buf1.write(f"Verified Clean  : {len(file_clean)}\n")
     buf1.write(f"Verified Banned : {len(file_banned)}\n")
     buf1.write(f"Inconsistent    : {len(inconsistent)}\n")
     buf1.write(f"Invalid Device  : {len(invalid_final)}\n")
     buf1.write("═" * 60 + "\n\n")
-
     buf1.write("┌──────────────────────────────────────────────┐\n")
     buf1.write("│  ✅ DEVICE ID TIDAK TERBANNED (VERIFIED 3X) │\n")
     buf1.write("└──────────────────────────────────────────────┘\n")
-    for d, data in file_clean:
-        pd = (data or {}).get("player_data") or {}
-        buf1.write(
-            f"DEVICE ID  : {d}\n"
-            f"ACCOUNT ID : {(data or {}).get('account_id', '-')}\n"
-            f"ZONE ID    : {(data or {}).get('zone_id', '-')}\n"
-            f"NICKNAME   : {pd.get('nickname', '-')}\n"
-            f"LEVEL      : {pd.get('level', 0)}\n"
-            f"SKIN       : {pd.get('skin_count', 0)}\n"
-            f"HERO       : {pd.get('hero_count', 0)}\n"
-            f"RANK       : {pd.get('current_rank', '-')}\n"
-            f"HIGH RANK  : {pd.get('high_rank', '-')}\n"
-            f"{'-' * 58}\n"
-        )
+    for d_id, data in file_clean:
+        buf1.write(_verif_format_clean_record(d_id, data))
     if not file_clean:
         buf1.write("(Tidak ada device yang terverifikasi clean)\n")
-
     if inconsistent:
         buf1.write("\n")
         buf1.write("┌──────────────────────────────────────────────┐\n")
-        buf1.write("│  ⚠️ INCONSISTENT (TIDAK DIVERIFIKASI)        │\n")
+        buf1.write("│  ⚠️  INCONSISTENT (TIDAK DIVERIFIKASI)       │\n")
         buf1.write("└──────────────────────────────────────────────┘\n")
-        for d, reason in inconsistent:
-            buf1.write(f"{d} | INCONSISTENT | {reason}\n")
-
+        for d_id, reason in inconsistent:
+            buf1.write(f"{d_id} |  INCONSISTENT  |  {reason}\n")
     if invalid_final:
         buf1.write("\n")
         buf1.write("┌──────────────────────────────────────────────┐\n")
         buf1.write("│  ❌ INVALID DEVICE ID (GAGAL VALID)          │\n")
         buf1.write("└──────────────────────────────────────────────┘\n")
-        for d in invalid_final:
-            buf1.write(f"{d}\n")
+        for d_id in invalid_final:
+            buf1.write(f"{d_id}\n")
 
-    # ----- FILE 2: SUDAH TERBANNED -----
+    # ── FILE 2 ──
     buf2 = io.StringIO()
     buf2.write("═" * 60 + "\n")
     buf2.write("WEIRDMARKET — DEVICE ID SUDAH TERBANNED\n")
     buf2.write("(Hasil Verifikasi 3X SCAN — Valid + Banned)\n")
     buf2.write("═" * 60 + "\n")
-    buf2.write(f"Timestamp       : {ts_str}\n")
+    buf2.write(f"Timestamp       : {ts_full}\n")
     buf2.write(f"Total Input     : {total}\n")
     buf2.write(f"Verified Banned : {len(file_banned)}\n")
     buf2.write("═" * 60 + "\n\n")
-
     buf2.write("┌──────────────────────────────────────────────┐\n")
     buf2.write("│  🚫 DEVICE ID SUDAH TERBANNED (VERIFIED 3X) │\n")
     buf2.write("└──────────────────────────────────────────────┘\n")
-    for l in file_banned:
-        buf2.write(l + "\n")
+    for _d_id, line in file_banned:
+        buf2.write(line + "\n")
     if not file_banned:
         buf2.write("(Tidak ada device yang terverifikasi banned)\n")
-
-    fname1 = f"Device ID Tidak Terbanned {date_str}.txt"
-    fname2 = f"Device ID Sudah Terbanned {date_str}.txt"
 
     out1 = io.BytesIO(buf1.getvalue().encode("utf-8"))
     out2 = io.BytesIO(buf2.getvalue().encode("utf-8"))
 
-    # ===== KIRIM FILE 1 =====
+    # Send File 1
     try:
         await context.bot.send_document(
             chat_id=cid,
             document=InputFile(out1, filename=fname1),
             caption=(f"✅ *DEVICE ID TIDAK TERBANNED*\n"
                      f"━━━━━━━━━━━━━━━━━━━━\n"
-                     f"📅 {ts_str}\n\n"
+                     f"📅 {ts_full}\n\n"
                      f"📱 Total       : `{total}`\n"
                      f"✅ Verified    : `{len(file_clean)}`\n"
                      f"⚠️ Inconsistent: `{len(inconsistent)}`\n"
                      f"❌ Invalid     : `{len(invalid_final)}`"),
             parse_mode="Markdown")
     except Exception as e:
-        print(f"[VERIF3X] send file1 err: {e}")
+        print(f"[BOT VERIF3X] send file1 err: {e}")
 
-    # ===== KIRIM FILE 2 =====
+    # Send File 2
     try:
         await context.bot.send_document(
             chat_id=cid,
             document=InputFile(out2, filename=fname2),
             caption=(f"🚫 *DEVICE ID SUDAH TERBANNED*\n"
                      f"━━━━━━━━━━━━━━━━━━━━\n"
-                     f"📅 {ts_str}\n\n"
+                     f"📅 {ts_full}\n\n"
                      f"🚫 Verified Banned : `{len(file_banned)}`"),
             parse_mode="Markdown")
     except Exception as e:
-        print(f"[VERIF3X] send file2 err: {e}")
+        print(f"[BOT VERIF3X] send file2 err: {e}")
 
-    # ===== EDIT FINAL STATUS =====
+    # Final edit
     try:
         await context.bot.edit_message_text(
             chat_id=cid, message_id=msg.message_id,
@@ -2358,49 +3093,147 @@ async def run_verif_3x(update, context, uid, devices, msg):
                   f"⚠️ Inconsistent : `{len(inconsistent)}`\n"
                   f"❌ Invalid      : `{len(invalid_final)}`\n\n"
                   f"📁 File hasil sudah dikirim di atas."),
-            parse_mode="Markdown", reply_markup=back_kb())
+            parse_mode="Markdown", reply_markup=bot_back_kb())
     except Exception:
         pass
 
 
-# ──────────────────────────────────────────────────────────────────────
-# POST INIT & MAIN
-# ──────────────────────────────────────────────────────────────────────
-async def post_init(app):
+# ── Bot: split runner ───────────────────────────────────────────────
+async def bot_do_split(update, context, clean, duplicates, mode, size, msg):
+    cid = msg.chat_id
+    out_dir = RESULTS / "split_bot"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for old in out_dir.glob("*.txt"):
+        try:
+            old.unlink()
+        except Exception:
+            pass
+
+    def write_chunks(items, prefix, full_info=False):
+        parts = 0
+        for start in range(0, len(items), size):
+            parts += 1
+            chunk = items[start:start + size]
+            path = out_dir / f"{prefix}_{parts:03d}.txt"
+            with path.open("w", encoding="utf-8") as f:
+                for idx, item in enumerate(chunk, 1):
+                    if full_info:
+                        lines = item["text"].splitlines()
+                        if lines:
+                            f.write(f"{idx}. {lines[0]}\n")
+                            for line in lines[1:]:
+                                f.write(line + "\n")
+                        f.write("---\n")
+                    else:
+                        f.write(item + "\n")
+        return parts
+
+    try:
+        if mode == "split_full":
+            parts = write_chunks(clean, "full_info", full_info=True)
+            await msg.edit_text(
+                f"✅ *SPLIT FULL INFO*\n\n📄 Total: `{len(clean)}`\n🔢 File: `{parts}`",
+                parse_mode="Markdown", reply_markup=bot_back_kb())
+        elif mode == "split_devid":
+            ids = [r["id"] for r in clean]
+            parts = write_chunks(ids, "device_id")
+            await msg.edit_text(
+                f"✅ *SPLIT DEVICE ID*\n\n📄 Total: `{len(ids)}`\n🔢 File: `{parts}`",
+                parse_mode="Markdown", reply_markup=bot_back_kb())
+        elif mode == "split_plat":
+            ids_and = [r["id"] for r in clean if r["id"].lower().startswith("and_")]
+            ids_ios = [r["id"] for r in clean if r["id"].lower().startswith("ios_")]
+            parts_and = write_chunks(ids_and, "android_and")
+            parts_ios = write_chunks(ids_ios, "ios")
+            await msg.edit_text(
+                f"✅ *SPLIT ANDROID / iOS*\n\n"
+                f"🤖 Android: `{len(ids_and)}` ID / `{parts_and}` file\n"
+                f"🍎 iOS: `{len(ids_ios)}` ID / `{parts_ios}` file",
+                parse_mode="Markdown", reply_markup=bot_back_kb())
+        elif mode == "split_dedup":
+            android = [r for r in clean if r["id"].lower().startswith("and_")]
+            ios = [r for r in clean if r["id"].lower().startswith("ios_")]
+
+            def save_num(path, recs):
+                with path.open("w", encoding="utf-8") as f:
+                    for i, record in enumerate(recs, 1):
+                        lines = record["text"].splitlines()
+                        if lines:
+                            f.write(f"{i}. {lines[0]}\n")
+                            for line in lines[1:]:
+                                f.write(line + "\n")
+                        f.write("---\n")
+
+            save_num(out_dir / "all_devices.txt", clean)
+            save_num(out_dir / "android_and.txt", android)
+            save_num(out_dir / "ios.txt", ios)
+            await msg.edit_text(
+                f"✅ *DEDUP + EXPORT FULL INFO*\n\n"
+                f"📄 Total unik: `{len(clean)}`\n"
+                f"🗑️ Duplikat: `{duplicates}`",
+                parse_mode="Markdown", reply_markup=bot_back_kb())
+
+        # Zip & send
+        try:
+            zip_path = out_dir / "_all_split.zip"
+            with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                for fp in out_dir.glob("*.txt"):
+                    zf.write(fp, arcname=fp.name)
+            with open(zip_path, "rb") as f:
+                await context.bot.send_document(
+                    chat_id=cid,
+                    document=InputFile(f, filename="_all_split.zip"),
+                    caption=f"📦 *Semua file split* ({len(clean)} record)",
+                    parse_mode="Markdown")
+        except Exception as e:
+            print(f"[BOT SPLIT] zip err: {e}")
+    except Exception as e:
+        await msg.edit_text(f"❌ Error: {e}", reply_markup=bot_back_kb())
+
+
+# ── Bot: post_init & runner ─────────────────────────────────────────
+async def bot_post_init(app):
     try:
         await app.bot.delete_webhook(drop_pending_updates=True)
         me = await app.bot.get_me()
         print(f"🤖 Bot: @{me.username} (id: {me.id})")
     except Exception as e:
-        print(f"[POST_INIT] {e}")
+        print(f"[BOT POST_INIT] {e}")
 
 
-def main():
+def run_telegram_bot():
     if not BOT_TOKEN or ":" not in BOT_TOKEN:
         print("❌ Token invalid!")
-        import sys
-        sys.exit(1)
+        return
 
     print("=" * 60)
-    print("🌟 WEIRDMARKET TELEGRAM BOT (FULLCHECK + 4-STEP VERIFY)")
+    print("🌟 WEIRDMARKET TELEGRAM BOT")
     print("=" * 60)
     print(f"Token   : {BOT_TOKEN[:20]}...")
     print(f"Owner   : {OWNER_ID}")
-    print(f"Threads : {BULK_THREADS}")
     print(f"MaxFile : {MAX_FILE_SIZE // 1024 // 1024} MB")
     print("=" * 60)
 
-    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
+    app = Application.builder().token(BOT_TOKEN).post_init(bot_post_init).build()
 
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("cancel", cmd_cancel))
-    app.add_handler(CallbackQueryHandler(button_router))
-    app.add_handler(MessageHandler(filters.Document.ALL, on_document))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    app.add_handler(CommandHandler("start", bot_cmd_start))
+    app.add_handler(CommandHandler("cancel", bot_cmd_cancel))
+    app.add_handler(CallbackQueryHandler(bot_button_router))
+    app.add_handler(MessageHandler(filters.Document.ALL, bot_on_document))
+    app.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND, bot_on_text))
 
     print("✅ Bot running...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+    app.run_polling(allowed_updates=Update.ALL_TYPES,
+                    drop_pending_updates=True)
 
 
+# ══════════════════════════════════════════════════════════════════════
+# ENTRY POINT
+# ══════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
-    main()
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1].lower() == "cli":
+        main_menu()
+    else:
+        run_telegram_bot()
